@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { Crawler } from './crawler.js';
 import { AssetManager } from './asset-manager.js';
-import { transform } from './transformer/index.js';
+import { transform, detectPackages } from './transformer/index.js';
 import { bundle, bundleSite } from './bundler.js';
 import { SiteCrawler } from './site-crawler.js';
 import { remapLinks } from './link-mapper.js';
@@ -55,10 +55,15 @@ async function exportSinglePage(options: MultiPageExportOptions): Promise<void> 
   const processed = await assetManager.processPage(html, baseUrl);
   logger.info('Assets processed', { assetCount: processed.assets.size });
 
-  // Step 4: Transform (clean + fix forms)
+  // Step 4: Transform (clean + fix forms + inject CDNs)
   logger.info('Step 3/4: Cleaning HTML...');
+  const detected = detectPackages(processed.html, processed.assets);
+  if (detected.length > 0) {
+    logger.info(`Detected libraries (CDN injected): ${detected.join(', ')}`);
+  }
   const cleanHtml = transform(processed.html, {
     webhookUrl: options.webhookUrl,
+    assets: processed.assets,
   });
 
   // Step 5: Bundle into ZIP
@@ -113,10 +118,14 @@ async function exportMultiPage(options: MultiPageExportOptions): Promise<void> {
 
   logger.info('Assets processed', { totalAssets: sharedAssets.size, pages: processedPages.length });
 
-  // Step 3: Transform HTML (clean builder artifacts + fix forms)
+  // Step 3: Transform HTML (clean builder artifacts + fix forms + inject CDNs)
   logger.info('Step 3/5: Cleaning HTML...');
+  const detectedMulti = detectPackages(processedPages[0]?.html ?? '', sharedAssets);
+  if (detectedMulti.length > 0) {
+    logger.info(`Detected libraries (CDN injected): ${detectedMulti.join(', ')}`);
+  }
   for (const page of processedPages) {
-    page.html = transform(page.html, { webhookUrl: options.webhookUrl });
+    page.html = transform(page.html, { webhookUrl: options.webhookUrl, assets: sharedAssets });
   }
 
   // Step 4: Remap internal links to relative paths

@@ -151,6 +151,48 @@ Tracking noscript pixels from `googletagmanager`, `facebook`, and `doubleclick` 
 
 Form actions are preserved in a `data-original-action` attribute. The `action` attribute is replaced with the webhook URL (if provided via `--webhook`) or `#`. Platform-specific form attributes (`data-wf-page-id`, `wf-form`, `data-hook`, `data-node-type`) are removed.
 
+## Animation & UI Library Auto-Injection
+
+The exporter scans the page for known animation/UI library signatures and automatically injects the appropriate CDN `<script>` tag into `<head>` so animations keep working in the exported HTML.
+
+Detection sources (in order):
+
+1. Inline `<script>` blocks (e.g. `gsap.to(...)`, `AOS.init()`, `new Swiper(...)`)
+2. External `<script src>` URLs (e.g. references to `gsap.min.js`, `lottie.min.js`)
+3. HTML attributes (e.g. `data-aos`, `data-tilt`, `x-data`, `data-rellax-speed`)
+4. `<link href>` references (e.g. `aos.css`, `swiper-bundle.css`)
+
+Bundled JS files (Webpack/Vite/Framer outputs) are intentionally **not** scanned — modern bundlers inline library code, so a CDN injection would duplicate or conflict with the bundled version.
+
+Supported libraries:
+
+| Library | CDN |
+|---|---|
+| GSAP (+ ScrollTrigger, ScrollSmoother) | cdnjs |
+| Framer Motion | unpkg |
+| AOS (Animate On Scroll) | unpkg |
+| Swiper | jsdelivr |
+| Lottie Web | cdnjs |
+| Three.js | cdnjs |
+| anime.js | cdnjs |
+| Locomotive Scroll | jsdelivr |
+| ScrollMagic | cdnjs |
+| Alpine.js | jsdelivr |
+| jQuery | cdnjs |
+| Tippy.js | unpkg |
+| Chart.js | jsdelivr |
+| Typed.js | jsdelivr |
+| particles.js | jsdelivr |
+| VanillaTilt | cdnjs |
+| Splitting | unpkg |
+| Rellax | cdnjs |
+| ScrollReveal | unpkg |
+| Barba.js | jsdelivr |
+| Matter.js | cdnjs |
+| p5.js | cdnjs |
+
+Injected tags are wrapped with `<!-- Cleave: auto-injected -->` markers and tagged with `data-cleave-cdn="<name>"` for easy identification. Duplicates are skipped if the same library is already loaded via an existing `<script src>` tag.
+
 ## Architecture
 
 ### Single-Page Pipeline

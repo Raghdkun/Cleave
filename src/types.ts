@@ -17,6 +17,8 @@ export interface ProcessedPage {
 
 export interface TransformOptions {
   webhookUrl?: string;
+  /** Optional asset map — when provided, enables CDN package detection/injection. */
+  assets?: Map<string, AssetRecord>;
 }
 
 export interface ExportOptions {
