@@ -1,0 +1,140 @@
+product_name: website-exporter
+version: "1.0.0"
+created_at: "2026-04-17"
+last_updated: "2026-04-17"
+status: approved
+
+overview: |
+  A modular Node.js/TypeScript CLI tool that exports a fully rendered website into a portable,
+  clean ZIP package. It uses Playwright for headless crawling to capture JavaScript-rendered content,
+  recursively downloads all referenced assets (images, CSS, JS, fonts, media), rewrites all paths
+  to be relative/local, strips platform-specific bloat (Webflow, Wix, Framer), fixes form actions,
+  and bundles everything into a structured ZIP archive.
+
+target_users:
+  - Designers exporting client websites built on Webflow/Wix/Framer
+  - Developers archiving or migrating static site snapshots
+  - Agencies delivering clean HTML/CSS packages to clients
+
+user_stories:
+  - id: US-1
+    as: a user
+    i_want: to provide a URL and receive a ZIP of the fully rendered page
+    so_that: I can host the site statically or deliver it to a client
+    acceptance_criteria:
+      - id: AC-1
+        criteria: CLI accepts a URL argument and outputs a ZIP file
+      - id: AC-2
+        criteria: The exported HTML reflects the fully rendered page (JavaScript-rendered content included)
+
+  - id: US-2
+    as: a user
+    i_want: all assets (CSS, JS, images, fonts, media) downloaded and paths rewritten
+    so_that: the exported site works offline with no external dependencies
+    acceptance_criteria:
+      - id: AC-3
+        criteria: All referenced assets (img src, link href, script src, srcset, CSS url(), @import) are downloaded
+      - id: AC-4
+        criteria: All paths in HTML and CSS are rewritten to point to local copies
+      - id: AC-5
+        criteria: srcset attributes are fully parsed, each variant downloaded, and the attribute rewritten
+      - id: AC-6
+        criteria: CSS url() references (including nested @import) are recursively resolved and rewritten
+      - id: AC-7
+        criteria: Duplicate assets (same URL referenced multiple ways) are downloaded only once
+
+  - id: US-3
+    as: a user
+    i_want: platform bloat (Webflow, Wix, Framer artifacts) removed
+    so_that: I get clean, portable HTML/CSS without vendor lock-in
+    acceptance_criteria:
+      - id: AC-8
+        criteria: Webflow-specific attributes (data-wf-*), scripts, and badges are removed
+      - id: AC-9
+        criteria: Wix-specific elements, attributes, and injected code are removed
+      - id: AC-10
+        criteria: Framer-specific attributes, elements, and badges are removed
+      - id: AC-11
+        criteria: General analytics/tracking scripts (GTM, Facebook Pixel) are removed
+
+  - id: US-4
+    as: a user
+    i_want: form actions updated to a configurable placeholder
+    so_that: exported forms don't point to dead platform endpoints
+    acceptance_criteria:
+      - id: AC-12
+        criteria: Form action attributes are detected and rewritten to a configurable webhook URL or placeholder
+
+  - id: US-5
+    as: a user
+    i_want: the output bundled in a structured ZIP
+    so_that: I can easily navigate and deploy the exported site
+    acceptance_criteria:
+      - id: AC-13
+        criteria: Output ZIP contains index.html at root with assets organized in subdirectories (css/, js/, images/, fonts/, media/)
+      - id: AC-14
+        criteria: ZIP uses DEFLATE compression
+
+scope:
+  in_scope:
+    - Single-page export (one URL → one ZIP)
+    - Full asset downloading (CSS, JS, images, fonts, media, favicons)
+    - Path rewriting (HTML attributes + CSS url()/@import)
+    - Platform bloat cleaning (Webflow, Wix, Framer, analytics)
+    - Form action rewriting
+    - ZIP bundling with structured directories
+    - SSRF prevention for asset downloads
+    - Concurrency-limited parallel downloads
+    - Graceful error handling (fail-soft on individual asset failures)
+  out_of_scope:
+    - Multi-page/site-wide crawling (future feature)
+    - Server-side rendering or dynamic content generation
+    - Authentication/login-gated pages
+    - Service Worker / PWA artifact handling
+    - GUI or web interface (CLI only)
+    - Automated deployment of exported sites
+
+acceptance_criteria:
+  - id: AC-1
+    criteria: CLI accepts a URL argument and outputs a ZIP file
+  - id: AC-2
+    criteria: The exported HTML reflects the fully rendered page (JavaScript-rendered content included)
+  - id: AC-3
+    criteria: All referenced assets (img src, link href, script src, srcset, CSS url(), @import) are downloaded
+  - id: AC-4
+    criteria: All paths in HTML and CSS are rewritten to point to local copies
+  - id: AC-5
+    criteria: srcset attributes are fully parsed, each variant downloaded, and the attribute rewritten
+  - id: AC-6
+    criteria: CSS url() references (including nested @import) are recursively resolved and rewritten
+  - id: AC-7
+    criteria: Duplicate assets (same URL referenced multiple ways) are downloaded only once
+  - id: AC-8
+    criteria: Webflow-specific attributes (data-wf-*), scripts, and badges are removed
+  - id: AC-9
+    criteria: Wix-specific elements, attributes, and injected code are removed
+  - id: AC-10
+    criteria: Framer-specific attributes, elements, and badges are removed
+  - id: AC-11
+    criteria: General analytics/tracking scripts (GTM, Facebook Pixel) are removed
+  - id: AC-12
+    criteria: Form action attributes are detected and rewritten to a configurable webhook URL or placeholder
+  - id: AC-13
+    criteria: Output ZIP contains index.html at root with assets organized in subdirectories
+  - id: AC-14
+    criteria: ZIP uses DEFLATE compression
+
+technical_decisions:
+  module_system: "ESM (type: module)"
+  typescript_config: "strict mode, module: NodeNext, moduleResolution: NodeNext"
+  runtime: "Node.js 18+"
+  core_packages:
+    - playwright (headless crawling)
+    - cheerio (HTML parsing/manipulation)
+    - postcss + postcss-value-parser (CSS url() extraction)
+    - got (HTTP client with stream support)
+    - p-limit (concurrency control)
+    - jszip (ZIP bundling)
+    - srcset (srcset attribute parsing)
+
+needs_clarification: []

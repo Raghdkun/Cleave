@@ -1,0 +1,22 @@
+node_modules/
+dist/
+*.zip
+
+# Test output directories
+grillify-test/
+slice-town/
+slice-town-html/
+webflow/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
