@@ -1,6 +1,8 @@
 node_modules/
 dist/
 *.zip
+web/node_modules/
+web/dist/
 
 # Test output directories
 grillify-test/

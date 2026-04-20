@@ -191,164 +191,61 @@ URL → SiteCrawler (BFS) → AssetManager (per page) → Transformer → LinkMa
 |---|---|---|---|
 | `LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` | Controls log output verbosity |
 
-## Limitations
+## Web UI
 
-- Maximum 50 MB per individual asset download
-- 5 concurrent asset downloads
-- Maximum CSS `@import` recursion depth of 10
-- Navigation timeout of 30 seconds per page load
+Cleave includes a web interface for exporting websites through a browser.
 
-## License
-
-MIT
-# Website Exporter
-
-A Node.js/TypeScript CLI tool that exports a fully rendered website into a portable, clean ZIP package. It uses Playwright to crawl a page with full JavaScript rendering, downloads all referenced assets, strips platform bloat and analytics trackers, rewrites paths for offline use, and bundles everything into a compressed ZIP file.
-
-## Features
-
-- Playwright-based headless crawling with full JavaScript rendering
-- Recursive asset downloading (images, CSS, JS, fonts, media)
-- CSS deep scanning (`url()` references and `@import` recursion)
-- `srcset` responsive image support
-- Path rewriting (absolute to relative) for offline portability
-- Asset deduplication via content-addressed local paths
-- Platform bloat removal (Webflow, Wix, Framer)
-- Analytics and tracking script removal
-- Form action rewriting with optional webhook forwarding
-- SSRF protection (private IP and DNS rebinding checks)
-- DEFLATE-compressed ZIP output
-- Fail-soft error handling (individual asset failures don't abort the export)
-
-## Prerequisites
-
-- Node.js 18+
-- npm
-
-## Installation
+### Quick Start
 
 ```bash
-git clone <repo-url>
-cd website-exporter
+cd web
 npm install
-npx playwright install chromium
+npm run dev
 ```
 
-## Usage
+This starts both the API server (port 3001) and the Vite dev server (port 5173). Open `http://localhost:5173`.
+
+### Production
 
 ```bash
-# Basic export (outputs export.zip)
-npx tsx src/index.ts https://example.com
-
-# Custom output filename
-npx tsx src/index.ts https://example.com -o my-site.zip
-
-# With form webhook URL
-npx tsx src/index.ts https://example.com -w https://hooks.example.com/submit
-
-# All options combined
-npx tsx src/index.ts https://example.com --output my-site.zip --webhook https://hooks.example.com/submit
+cd web
+npm run build
+npm start
 ```
 
-### CLI Options
+Serves the built frontend and API from a single Express server on port 3001.
 
-| Option | Alias | Description | Default |
-|---|---|---|---|
-| `<url>` | | Target URL to export (required) | |
-| `--output` | `-o` | Output ZIP filename | `export.zip` |
-| `--webhook` | `-w` | Webhook URL to replace form actions with | |
+### Web UI Features
 
-## Output Structure
+- **Real-time progress** — SSE-based live progress with step-by-step tracking
+- **Live log output** — scrolling terminal showing export logs
+- **Advanced options** — configurable crawl depth, max pages, concurrency
+- **ZIP download** — one-click download when export finishes
+- **Cancel support** — abort in-progress exports
+- **Job cleanup** — auto-cleanup of expired jobs (30 min TTL)
 
-```
-export.zip
-├── index.html
-└── assets/
-    ├── css/
-    ├── js/
-    ├── images/
-    ├── fonts/
-    ├── media/
-    └── other/
-```
+### API Endpoints
 
-Assets are categorized by file extension and content type. Filenames are preserved from the original URLs; duplicates are disambiguated with a numeric suffix.
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/export` | Start a new export job. Body: `{ url, depth?, maxPages?, concurrency? }` |
+| `GET` | `/api/export/:id/progress` | SSE stream of export progress |
+| `GET` | `/api/export/:id/download` | Download the completed ZIP file |
+| `DELETE` | `/api/export/:id` | Cancel an in-progress export |
+| `GET` | `/api/health` | Health check |
 
-## What Gets Cleaned
+### Tech Stack
 
-### Webflow
-
-- `data-wf-*`, `data-w-id`, `data-wf-domain`, `data-wf-page`, `data-wf-site` attributes
-- Scripts with `webflow` in source URL or inline content
-- `.w-webflow-badge` elements
-
-### Wix
-
-- `data-mesh-id`, `data-testid`, `data-hook`, `corvid-*` attributes
-- `wix-*` custom elements
-- Scripts and styles containing `wix` or `_wixCssModules`
-
-### Framer
-
-- `data-framer-*` attributes
-- Elements with `__framer-` in class or id
-- "Made with Framer" badge links
-
-### Analytics and Tracking
-
-The following trackers are removed from scripts and noscript tags:
-
-| Tracker | Detected Patterns |
+| Layer | Technology |
 |---|---|
-| Google Tag Manager | `googletagmanager`, `gtag/js`, `gtag()`, `dataLayer.push` |
-| Google Analytics | `google-analytics`, `ga('...)`, `_gaq` |
-| Facebook Pixel | `fbevents`, `connect.facebook`, `fbq()` |
-| Intercom | `widget.intercom`, `intercomSettings`, `Intercom()` |
-| Drift | `js.driftt` |
-| Crisp | `client.crisp` |
-| Hotjar | `hotjar` |
-| Microsoft Clarity | `clarity.ms` |
-
-Tracking noscript pixels from `googletagmanager`, `facebook`, and `doubleclick` domains are also removed.
-
-### Forms
-
-Form actions are preserved in a `data-original-action` attribute. The `action` attribute is replaced with the webhook URL (if provided via `--webhook`) or `#`. Platform-specific form attributes (`data-wf-page-id`, `wf-form`, `data-hook`, `data-node-type`) are removed.
-
-## Architecture
-
-The export pipeline runs four sequential stages:
-
-```
-URL --> Crawler --> AssetManager --> Transformer --> Bundler --> ZIP
-```
-
-| Module | Responsibility |
-|---|---|
-| **Crawler** (`src/crawler.ts`) | Launches a headless Chromium browser via Playwright, navigates to the target URL, waits for network idle (with domcontentloaded fallback), and extracts the fully rendered HTML and resolved base URL. |
-| **AssetManager** (`src/asset-manager.ts`) | Parses the HTML for asset references (`src`, `href`, `srcset`, `poster`), downloads them concurrently, processes CSS files for nested `url()` and `@import` references, deduplicates assets, and rewrites all paths in the HTML to point to local files. |
-| **Transformer** (`src/transformer/`) | Runs the cleaner to strip platform-specific bloat and analytics scripts, then runs the form fixer to rewrite form actions. |
-| **Bundler** (`src/bundler.ts`) | Packages the cleaned HTML as `index.html` and all downloaded assets into a DEFLATE-compressed ZIP file. |
-
-Supporting utilities:
-
-| Module | Responsibility |
-|---|---|
-| **URL Validator** (`src/utils/url-validator.ts`) | SSRF protection: blocks private IPs, localhost, `.local` domains, link-local addresses, and non-HTTP(S) schemes via DNS resolution. |
-| **URL Resolver** (`src/utils/url-resolver.ts`) | Resolves relative URLs against a base URL. |
-| **Logger** (`src/utils/logger.ts`) | Structured logging with configurable level and timestamped JSON output. |
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Values | Default | Description |
-|---|---|---|---|
-| `LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` | Controls log output verbosity |
+| Frontend | React 19 + Vite + Tailwind CSS 4 |
+| Animations | Framer Motion |
+| Icons | Lucide React |
+| API Server | Express.js |
+| Progress | Server-Sent Events (SSE) |
 
 ## Limitations
 
-- Single-page export only -- does not follow links to crawl multiple pages
 - Maximum 50 MB per individual asset download
 - 5 concurrent asset downloads
 - Maximum CSS `@import` recursion depth of 10
