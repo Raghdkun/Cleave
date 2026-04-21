@@ -49,6 +49,70 @@ const EXT_TO_CATEGORY: Record<string, string> = {
 
 const SKIP_SCHEMES = ['data:', 'blob:', 'javascript:'];
 
+// Hosts whose URLs frequently appear inside HTML/JS but are NOT static assets
+// we can fetch (player APIs, telemetry beacons, dev examples, source maps).
+// Anything matching here is filtered out before we even try to download.
+const NOISE_HOST_BLOCKLIST = new Set([
+  'github.com',
+  'github.githubassets.com',
+  'app.framerstatic.com',
+  // YouTube IFrame Player internals — these paths (base.js, load.js,
+  // main_light_binary.js, youtubei/*) are NOT public assets; the embed
+  // resolves them dynamically against versioned subpaths. Trying to GET
+  // https://www.youtube.com/base.js always returns 404.
+  'www.youtube.com',
+  'youtube.com',
+  'youtubei.googleapis.com',
+  // Google Bot / WAA telemetry probes
+  'jnn-pa.googleapis.com',
+  'play.google.com',
+  // Common analytics / tag managers
+  'www.google-analytics.com',
+  'www.googletagmanager.com',
+  'analytics.google.com',
+  'stats.g.doubleclick.net',
+  'connect.facebook.net',
+  'www.facebook.com',
+  'snap.licdn.com',
+  'px.ads.linkedin.com',
+]);
+// Hosts where only specific path prefixes are real assets
+const HOST_PATH_ALLOWLIST: Record<string, string[]> = {
+  'framerusercontent.com': ['/images/', '/assets/', '/modules/'],
+};
+
+// Per-host path denylist (regex, applied if no allowlist matches).
+// Use for hosts that ARE valid CDNs but contain known-stale paths inside
+// their JS bundles (template strings, legacy structures, etc.).
+const HOST_PATH_DENY_REGEX: Record<string, RegExp> = {
+  // Webflow CDN: legacy /{siteId}/(fonts|images|videos|documents)/... paths
+  // appear as string literals in bundled JS but always 403. Real assets are
+  // served flat at /{siteId}/{filename}.
+  'cdn.prod.website-files.com': /^\/[a-f0-9]{20,}\/(?:fonts|images|videos|documents)\//i,
+  'uploads-ssl.webflow.com': /^\/[a-f0-9]{20,}\/(?:fonts|images|videos|documents)\//i,
+};
+
+export function isLikelyAssetUrl(raw: string): boolean {
+  // Reject template literal placeholders (raw or URL-encoded)
+  if (raw.includes('${') || raw.includes('%7B') || raw.includes('%7b')) return false;
+  // Reject backslash-escape sequences (string literals, not real URLs)
+  if (raw.includes('\\u') || raw.includes('\\x')) return false;
+  let u: URL;
+  try { u = new URL(raw); } catch { return false; }
+  if (!/^https?:$/.test(u.protocol)) return false;
+  if (!u.hostname.includes('.')) return false;
+  // Hostname must not look like a bare filename (e.g. "ga.js")
+  if (/\.(?:js|mjs|css|json|png|jpe?g|svg|gif|webp|woff2?)$/i.test(u.hostname)) return false;
+  // Host-specific allowlist (positive match)
+  const allowed = HOST_PATH_ALLOWLIST[u.hostname];
+  if (allowed) return allowed.some((p) => u.pathname.startsWith(p));
+  if (NOISE_HOST_BLOCKLIST.has(u.hostname)) return false;
+  // Host-specific path denylist (negative match)
+  const deny = HOST_PATH_DENY_REGEX[u.hostname];
+  if (deny && deny.test(u.pathname)) return false;
+  return true;
+}
+
 function hashUrl(url: string): string {
   return createHash('md5').update(url).digest('hex').slice(0, 10);
 }
@@ -62,6 +126,10 @@ export class AssetManager {
   private readonly timeout: number;
   private baseUrl = '';
   private readonly localPathCounts: Map<string, number> = new Map();
+  // URLs whose local path is fixed (because a parent JS file imports them
+  // via a relative specifier like "./dist/chunk-X.js" and we must keep the
+  // dir layout for the import to resolve locally).
+  private readonly pinnedLocalPath: Map<string, string> = new Map();
 
   constructor(config?: AssetManagerConfig) {
     this.concurrency = config?.concurrency ?? DEFAULT_CONCURRENCY;
@@ -104,7 +172,22 @@ export class AssetManager {
       ext = extname(lastSegment).toLowerCase();
 
       if (lastSegment && ext) {
-        filename = lastSegment;
+        // URL-decode iteratively so the on-disk filename matches what browsers
+        // request after they decode the path. Some CDNs (Webflow) double-encode
+        // filenames containing spaces (e.g. "Foo%2520Bar.png" -> "Foo Bar.png").
+        // Stop when decoding is idempotent or after a small bound.
+        let decoded = lastSegment;
+        for (let i = 0; i < 3; i++) {
+          let next: string;
+          try {
+            next = decodeURIComponent(decoded);
+          } catch {
+            break;
+          }
+          if (next === decoded) break;
+          decoded = next;
+        }
+        filename = decoded;
       }
     } catch {
       // fall through
@@ -151,6 +234,8 @@ export class AssetManager {
       if (SKIP_SCHEMES.some((scheme) => seed.startsWith(scheme))) continue;
       // Only auto-include same-origin or asset-CDN URLs we can categorize
       if (!isAbsoluteUrl(seed)) continue;
+      // Filter out telemetry/analytics/player-internal noise
+      if (!isLikelyAssetUrl(seed)) continue;
       urls.add(seed);
     }
 
@@ -300,6 +385,12 @@ export class AssetManager {
       }
     }
 
+    // Final guard: don't bother fetching from known-noise hosts even if
+    // they slipped past earlier filters (e.g. third-party scripts).
+    if (!isLikelyAssetUrl(url)) {
+      return null;
+    }
+
     try {
       const safe = await isSafeUrl(url);
       if (!safe) {
@@ -307,12 +398,48 @@ export class AssetManager {
         return null;
       }
 
+      // Build headers that look like a real Chrome request. Some CDNs
+      // (notably Webflow's cdn.prod.website-files.com) return 403 to bare
+      // requests without a matching Referer/Origin or with an obviously
+      // automated User-Agent.
+      const ext = extname(new URL(url).pathname).toLowerCase();
+      let accept = '*/*';
+      if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.svg', '.ico'].includes(ext)) {
+        accept = 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8';
+      } else if (['.woff', '.woff2', '.ttf', '.otf', '.eot'].includes(ext)) {
+        accept = 'font/woff2,font/woff,*/*;q=0.8';
+      } else if (ext === '.css') {
+        accept = 'text/css,*/*;q=0.1';
+      } else if (ext === '.js' || ext === '.mjs') {
+        accept = '*/*';
+      }
+
+      const headers: Record<string, string> = {
+        'user-agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        accept,
+        'accept-language': 'en-US,en;q=0.9',
+        'accept-encoding': 'gzip, deflate, br',
+      };
+      if (this.baseUrl) {
+        try {
+          const baseOrigin = new URL(this.baseUrl).origin;
+          headers.referer = this.baseUrl;
+          headers.origin = baseOrigin;
+        } catch {
+          /* ignore malformed baseUrl */
+        }
+      }
+
       const response = await got(url, {
         responseType: 'buffer',
         timeout: { request: this.timeout },
-        headers: {
-          'user-agent': 'Mozilla/5.0 (compatible; WebsiteExporter/1.0)',
-        },
+        headers,
+        throwHttpErrors: true,
+        followRedirect: true,
+        decompress: true,
+        retry: { limit: 1 },
       });
 
       const contentLength = parseInt(response.headers['content-length'] ?? '0', 10);
@@ -327,7 +454,7 @@ export class AssetManager {
       }
 
       const contentType = response.headers['content-type'] ?? 'application/octet-stream';
-      const localPath = this.getLocalPath(url);
+      const localPath = this.pinnedLocalPath.get(url) ?? this.getLocalPath(url);
 
       const record: AssetRecord = {
         url,
@@ -341,7 +468,13 @@ export class AssetManager {
       return record;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      logger.error('Failed to download asset', { url, error: message });
+      // 403/404 from third-party CDNs is common and non-fatal — downgrade to warn
+      const isHttp4xx = /status code 4\d\d/.test(message);
+      if (isHttp4xx) {
+        logger.warn('Asset unavailable (skipped)', { url, error: message.split(':')[0] });
+      } else {
+        logger.error('Failed to download asset', { url, error: message });
+      }
       return null;
     }
   }
@@ -350,45 +483,23 @@ export class AssetManager {
    * Scan all downloaded JS bundles for additional asset URL references
    * (lazy-loaded chunks, dynamic imports, framework route maps).
    * Returns a Set of absolute URLs not yet downloaded.
+   *
+   * Side effect: for ES module relative imports (e.g. `import "./dist/x.js"`),
+   * pins the discovered URL's local path to mirror the parent's directory
+   * structure so the relative specifier still resolves after rewriting.
    */
   private discoverUrlsInJsBundles(baseUrl: string): Set<string> {
     const found = new Set<string>();
     // Match common asset extensions referenced as string literals inside JS.
-    // Captures: 1) absolute URLs (https?://...) and 2) relative paths starting
-    // with / or ./ that look like build-output asset paths.
+    // Captures: 1) absolute URLs (https?://...) and 2) absolute-rooted paths
+    // starting with / that look like build-output asset paths.
     const absRe = /https?:\/\/[^\s"'`<>()]+?\.(?:m?js|css|woff2?|ttf|otf|eot|json|wasm|png|jpe?g|gif|svg|webp|avif|mp4|webm|mp3|ogg)(?:\?[^\s"'`<>()]*)?/gi;
     const relRe = /["'`](\/[^\s"'`<>()]+?\.(?:m?js|css|woff2?|ttf|otf|wasm|json|png|jpe?g|gif|svg|webp|avif))(?:\?[^\s"'`<>()]*)?["'`]/gi;
+    // ES module relative imports: import ... from "./x.js" / import("./x.js") /
+    // import "./x.js" / from"./x.js". Only matches ./ or ../ specifiers.
+    const esmImportRe = /(?:\bimport\s*(?:[\w*${},\s]+from\s*)?|\bimport\s*\(\s*|\bfrom\s*)["'`](\.{1,2}\/[^"'`?]+\.(?:m?js|css|json))(?:\?[^"'`]*)?["'`]/g;
 
-    // Hosts that frequently appear as string-literal examples inside JS
-    // bundles (Framer dev tooling, GitHub assets referenced in source code,
-    // etc.) but never serve real assets we can fetch. Skip them entirely.
-    const exampleHostBlocklist = new Set([
-      'framerusercontent.com', // valid for /images/ and /assets/, but bare paths like /package.json are template strings
-      'github.com',
-      'github.githubassets.com',
-      'app.framerstatic.com', // serviceWorker.js is 403
-    ]);
-    // Paths under framerusercontent we DO want (real uploaded assets)
-    const framerUserAllowedPrefixes = ['/images/', '/assets/', '/modules/'];
-
-    const isLikelyValidAssetUrl = (raw: string): boolean => {
-      // Reject template literal placeholders (raw or URL-encoded)
-      if (raw.includes('${') || raw.includes('%7B') || raw.includes('%7b')) return false;
-      // Reject backslash-escape sequences (string literals, not real URLs)
-      if (raw.includes('\\u') || raw.includes('\\x')) return false;
-      let u: URL;
-      try { u = new URL(raw); } catch { return false; }
-      // Hostname must contain a dot AND must not look like a bare filename
-      // (e.g. "ga.js", "cdn.js" — JS variables that happened to match the regex)
-      if (!u.hostname.includes('.')) return false;
-      if (/\.(?:js|mjs|css|json|png|jpe?g|svg|gif|webp|woff2?)$/i.test(u.hostname)) return false;
-      // Block known noise hosts, with explicit allow-list for framerusercontent
-      if (u.hostname === 'framerusercontent.com') {
-        return framerUserAllowedPrefixes.some((p) => u.pathname.startsWith(p));
-      }
-      if (exampleHostBlocklist.has(u.hostname)) return false;
-      return true;
-    };
+    const isLikelyValidAssetUrl = (raw: string): boolean => isLikelyAssetUrl(raw);
 
     for (const asset of this.assets.values()) {
       const ct = asset.mimeType.toLowerCase();
@@ -427,6 +538,41 @@ export class AssetManager {
         } catch {
           /* ignore */
         }
+      }
+      // ES module relative imports: resolve against parent's URL AND pin the
+      // local path so the relative specifier keeps working after we save.
+      const parentLocalDir = posix.dirname(asset.localPath);
+      while ((m = esmImportRe.exec(text)) !== null) {
+        const spec = m[1]; // e.g. "./dist/chunk-X.js" or "../utils.js"
+        if (spec.includes('${') || spec.includes('\\u')) continue;
+        let resolvedUrl: string;
+        try {
+          resolvedUrl = new URL(spec, asset.url).toString();
+        } catch {
+          continue;
+        }
+        if (!isLikelyValidAssetUrl(resolvedUrl)) continue;
+        // Compute pinned local path mirroring the relative specifier so the
+        // original import keeps resolving without rewriting the JS source.
+        const cleanSpec = spec.replace(/^\.\//, '');
+        const pinned = posix.normalize(posix.join(parentLocalDir, cleanSpec));
+        // Safety: don't escape the assets/ root
+        if (!pinned.startsWith('assets/')) continue;
+
+        const existing = this.assets.get(resolvedUrl);
+        if (existing) {
+          // Already downloaded (e.g. by the browser network listener during
+          // crawl) but stored at the flat default path. Rehome it so the
+          // ./dist/chunk-X.js import still resolves locally.
+          if (existing.localPath !== pinned) {
+            existing.localPath = pinned;
+          }
+          continue;
+        }
+        if (!this.pinnedLocalPath.has(resolvedUrl)) {
+          this.pinnedLocalPath.set(resolvedUrl, pinned);
+        }
+        found.add(resolvedUrl);
       }
     }
     return found;
