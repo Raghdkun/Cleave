@@ -77,6 +77,7 @@ async function exportSinglePage(options: MultiPageExportOptions): Promise<void> 
     size: `${(zipBuffer.length / 1024 / 1024).toFixed(2)} MB`,
     assets: processed.assets.size,
   });
+  logger.info('IMPORTANT: unzip then run start.sh (mac/linux) or start.bat (windows). Do NOT open index.html via file:// - browsers block ES modules over file://, which breaks scroll animations and the JS runtime.');
 }
 
 async function exportMultiPage(options: MultiPageExportOptions): Promise<void> {
@@ -146,6 +147,7 @@ async function exportMultiPage(options: MultiPageExportOptions): Promise<void> {
     assets: sharedAssets.size,
     size: `${(zipBuffer.length / 1024 / 1024).toFixed(2)} MB`,
   });
+  logger.info('IMPORTANT: unzip then run start.sh (mac/linux) or start.bat (windows). Do NOT open index.html via file:// - browsers block ES modules over file://, which breaks scroll animations and the JS runtime.');
 }
 
 async function main(): Promise<void> {
