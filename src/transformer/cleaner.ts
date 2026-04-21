@@ -79,6 +79,34 @@ export function clean(html: string): string {
   });
 
   // --- Framer artifacts ---
+  // Detect whether the Framer JS runtime is being preserved in the export.
+  // If yes, we MUST NOT strip data-framer-* attributes (the runtime uses them
+  // to identify elements) and MUST NOT reset initial opacity/transform styles
+  // (the runtime needs the SSR-rendered hidden state to animate FROM).
+  // If no Framer runtime is present, fall back to the old static-snapshot
+  // behaviour so the page is at least visible without JS.
+  let framerRuntimePresent = false;
+  $('script[src]').each(function () {
+    const src = $(this).attr('src') ?? '';
+    // Match local copies of Framer runtime (script_main, framer.*.mjs,
+    // motion.*.mjs, react.*.mjs, render-*.mjs, chunk-*.mjs from Framer build)
+    if (
+      /script_main|framer\.[A-Za-z0-9_-]+\.mjs|motion\.[A-Za-z0-9_-]+\.mjs|render-[A-Z0-9]+\.mjs/.test(src) ||
+      /\/(?:assets\/js|js)\/chunk-[A-Z0-9]+\.mjs$/.test(src)
+    ) {
+      framerRuntimePresent = true;
+    }
+  });
+  // Also check inline scripts for framer runtime markers
+  if (!framerRuntimePresent) {
+    $('script:not([src])').each(function () {
+      const content = $(this).html() ?? '';
+      if (/__framer_|framer\.com\/edit\/init/i.test(content)) {
+        framerRuntimePresent = true;
+      }
+    });
+  }
+
   // Preserve data-framer attributes that CSS selectors depend on
   const FRAMER_KEEP_ATTRS = new Set([
     'data-framer-component-type',
@@ -86,31 +114,36 @@ export function clean(html: string): string {
     'data-framer-generated',
     'data-framer-name',
   ]);
-  $('*').each(function () {
-    if (!isElement(this)) return;
-    const el = $(this);
-    const attribs = this.attribs;
-    for (const attr of Object.keys(attribs)) {
-      if (attr.startsWith('data-framer-') && !FRAMER_KEEP_ATTRS.has(attr)) {
-        el.removeAttr(attr);
+  if (!framerRuntimePresent) {
+    $('*').each(function () {
+      if (!isElement(this)) return;
+      const el = $(this);
+      const attribs = this.attribs;
+      for (const attr of Object.keys(attribs)) {
+        if (attr.startsWith('data-framer-') && !FRAMER_KEEP_ATTRS.has(attr)) {
+          el.removeAttr(attr);
+        }
       }
-    }
-  });
+    });
+  }
 
   // --- Reset Framer appear-animation initial states ---
-  // Framer SSR renders scroll-triggered elements with opacity:0 + transform offsets.
-  // Without the JS runtime, they stay invisible. Reset them to visible.
-  $('*').each(function () {
-    if (!isElement(this)) return;
-    const style = this.attribs['style'];
-    if (!style) return;
-    if (/opacity\s*:\s*0/.test(style) && /transform\s*:/.test(style)) {
-      const fixed = style
-        .replace(/opacity\s*:\s*0/g, 'opacity: 1')
-        .replace(/transform\s*:[^;]+/g, 'transform: none');
-      $(this).attr('style', fixed);
-    }
-  });
+  // ONLY when the Framer JS runtime is NOT preserved. With the runtime present,
+  // resetting opacity/transform here would prevent the runtime from animating
+  // elements in (they would already be at the final state).
+  if (!framerRuntimePresent) {
+    $('*').each(function () {
+      if (!isElement(this)) return;
+      const style = this.attribs['style'];
+      if (!style) return;
+      if (/opacity\s*:\s*0/.test(style) && /transform\s*:/.test(style)) {
+        const fixed = style
+          .replace(/opacity\s*:\s*0/g, 'opacity: 1')
+          .replace(/transform\s*:[^;]+/g, 'transform: none');
+        $(this).attr('style', fixed);
+      }
+    });
+  }
 
   $('[class*="__framer-"], [id*="__framer-"]').remove();
 
