@@ -117,6 +117,27 @@ function hashUrl(url: string): string {
   return createHash('md5').update(url).digest('hex').slice(0, 10);
 }
 
+/**
+ * Encode a local asset path for safe use as an HTML/CSS URL value.
+ *
+ * The on-disk filename is the URL-decoded form (e.g. "Foo Bar.png") so the
+ * filesystem stores a single canonical name. But that decoded form cannot be
+ * embedded raw in an HTML `srcset` (commas/spaces are structural separators)
+ * or `src`/`href` (spaces are illegal in URLs). We percent-encode unsafe
+ * characters per segment while preserving the path structure (`/`).
+ *
+ * Re-encoding is idempotent for already-encoded paths because `%` itself is
+ * one of the chars we encode (`%` → `%25` would only happen if the input
+ * contained a literal `%` that wasn't part of an encoding, which our decoded
+ * filenames guarantee).
+ */
+export function encodeLocalUrl(path: string): string {
+  return path
+    .split('/')
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
+}
+
 export class AssetManager {
   private readonly assets: Map<string, AssetRecord> = new Map();
   private readonly visitedCss: Set<string> = new Set();
@@ -579,30 +600,37 @@ export class AssetManager {
   }
 
   rewriteHtmlPaths($: cheerio.CheerioAPI, pageLocalPath?: string): void {
-    const rewriteAttr = (selector: string, attr: string): void => {
+    const rewriteAttr = (selector: string, attr: string, stripSri = false): void => {
       $(selector).each((_, el) => {
         const val = $(el).attr(attr);
         if (!val) return;
         const resolved = resolveUrl(val, this.baseUrl);
         const record = this.assets.get(resolved);
         if (record) {
-          const path = pageLocalPath ? getRelativePath(pageLocalPath, record.localPath) : record.localPath;
-          $(el).attr(attr, path);
+          const raw = pageLocalPath ? getRelativePath(pageLocalPath, record.localPath) : record.localPath;
+          $(el).attr(attr, encodeLocalUrl(raw));
+          if (stripSri) {
+            // Subresource Integrity hashes are bound to the original CDN bytes; once we
+            // serve the file from a local path the browser will refuse to load it because
+            // the hash no longer matches. Same goes for crossorigin on a same-origin URL.
+            $(el).removeAttr('integrity');
+            $(el).removeAttr('crossorigin');
+          }
         }
       });
     };
 
     rewriteAttr('img[src]', 'src');
     rewriteAttr('img[data-src]', 'data-src');
-    rewriteAttr('script[src]', 'src');
+    rewriteAttr('script[src]', 'src', true);
     rewriteAttr('video[src]', 'src');
     rewriteAttr('source[src]', 'src');
     rewriteAttr('video[poster]', 'poster');
-    rewriteAttr('link[rel="stylesheet"][href]', 'href');
-    rewriteAttr('link[rel="modulepreload"][href]', 'href');
+    rewriteAttr('link[rel="stylesheet"][href]', 'href', true);
+    rewriteAttr('link[rel="modulepreload"][href]', 'href', true);
     rewriteAttr('link[rel="icon"][href]', 'href');
     rewriteAttr('link[rel="apple-touch-icon"][href]', 'href');
-    rewriteAttr('link[rel="preload"][href]', 'href');
+    rewriteAttr('link[rel="preload"][href]', 'href', true);
 
     const rewriteSrcset = (selector: string): void => {
       $(selector).each((_, el) => {
@@ -613,8 +641,11 @@ export class AssetManager {
           const rewritten = parsed.map(entry => {
             const resolved = resolveUrl(entry.url, this.baseUrl);
             const record = this.assets.get(resolved);
+            const raw = record
+              ? (pageLocalPath ? getRelativePath(pageLocalPath, record.localPath) : record.localPath)
+              : entry.url;
             return {
-              url: record ? (pageLocalPath ? getRelativePath(pageLocalPath, record.localPath) : record.localPath) : entry.url,
+              url: record ? encodeLocalUrl(raw) : raw,
               ...(entry.width !== undefined ? { width: entry.width } : {}),
               ...(entry.density !== undefined ? { density: entry.density } : {}),
             };
@@ -690,7 +721,7 @@ export class AssetManager {
         const record = this.assets.get(resolved);
         if (record) {
           const relativePath = htmlDir ? posix.relative(htmlDir, record.localPath) : record.localPath;
-          firstChild.value = relativePath;
+          firstChild.value = encodeLocalUrl(relativePath);
           if (firstChild.type === 'string') {
             firstChild.quote = "'";
           }
@@ -722,7 +753,7 @@ export class AssetManager {
       const record = this.assets.get(resolved);
       if (record) {
         const relativePath = htmlDir ? posix.relative(htmlDir, record.localPath) : record.localPath;
-        firstChild.value = relativePath;
+        firstChild.value = encodeLocalUrl(relativePath);
         if (firstChild.type === 'string') {
           firstChild.quote = "'";
         }
