@@ -118,6 +118,52 @@ export class Crawler {
         baseUrl = new URL(baseHref, baseUrl).href;
       }
 
+      // Sanitize transient mid-page-load DOM mutations before serializing.
+      //
+      // Many sites (Webflow especially) run a DOMContentLoaded handler that
+      // sets `body.style.overflow = "hidden"` to lock scroll while a preloader
+      // animation plays, then clears it when the preloader finishes. If the
+      // crawler captures the DOM while the preloader is still mid-animation
+      // (Webflow IX2 leaves it at `style="display: flex; opacity: 0;"`), the
+      // exported page boots with body locked AND a preloader element that
+      // never reaches `display: none`, so the lock is never released and the
+      // page is permanently un-scrollable / un-clickable.
+      //
+      // Strip the inline overflow on <html>/<body> so the static export starts
+      // with normal scroll. The page's own load script will re-apply it on the
+      // user's browser if needed; or the preloader will simply not block.
+      await page.evaluate(() => {
+        for (const el of [document.documentElement, document.body]) {
+          if (!el) continue;
+          if (/overflow\s*:/.test(el.getAttribute('style') ?? '')) {
+            el.style.removeProperty('overflow');
+            el.style.removeProperty('overflow-x');
+            el.style.removeProperty('overflow-y');
+            if (!el.getAttribute('style')?.trim()) el.removeAttribute('style');
+          }
+        }
+        // Reset preloader-style elements that animation systems left in a
+        // mid-animation state. We only target elements whose CLASS hints at
+        // "preloader" / "loader" / "loading" intent so we don't disturb
+        // legitimate page state.
+        const sel = '[class*="preloader"], [class*="page-loader"], [id*="preloader"]';
+        for (const el of document.querySelectorAll<HTMLElement>(sel)) {
+          // If JS animation parked it at opacity:0 / display:none / visibility:hidden,
+          // it has effectively finished. Remove it from the DOM so the page-author's
+          // own load script (which often does `if (!preloader) return;` then locks
+          // body.overflow waiting for a *future* preloader mutation) bails out
+          // instead of locking the page forever.
+          const cs = getComputedStyle(el);
+          const finished =
+            cs.display === 'none' ||
+            cs.visibility === 'hidden' ||
+            parseFloat(cs.opacity) <= 0.01;
+          if (finished) {
+            el.remove();
+          }
+        }
+      });
+
       const html = await page.content();
 
       logger.info(`Crawl complete. Base URL: ${baseUrl}`);
