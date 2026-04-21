@@ -171,16 +171,28 @@ export class Crawler {
         // continuously while the page runs. When we serialize the DOM
         // mid-flight, these inline values persist into the static export
         // and FREEZE the elements at whatever position they were in when
-        // we snapshotted (e.g. a 3D box rail stuck at translate3d(-130%),
-        // a swiper-wrapper offset to slide 3, a card with opacity:0 from
-        // a fade-in that never re-runs because IX2 thinks it already has).
+        // we snapshotted.
         //
-        // On reload the animation libs reinitialize but the conflicting
-        // inline values either fight with the lib or short-circuit it.
-        // Strip them so animations start from a clean slate.
+        // CAUTION: Some libraries (raw GSAP `gsap.set()`, ScrollTrigger
+        // pinned panels) use inline `transform` as the INITIAL LAYOUT —
+        // not animation state. Stripping those breaks the page (panels
+        // collapse, pinned sections un-pin, layouts overlap).
+        //
+        // We only strip when we can identify the value as JS-animation
+        // state by a STRONG signature, not a weak one:
+        //   - `data-w-id` attribute (Webflow IX2's marker — guaranteed)
+        //   - Webflow IX2's 6-component identity transform signature:
+        //     `scale3d(...) rotateX(...) rotateY(...) rotateZ(...) skew(...)`
+        //     all present in the same value (never written by humans, only
+        //     by IX2's bake-out).
+        //   - Swiper's runtime classes (well-known library)
         // ---------------------------------------------------------------
-        const ANIM_TRANSFORM_RE =
-          /translate3d|scale3d|matrix3d|matrix\(|rotate3d|rotateX|rotateY|rotateZ|skew\(|skewX|skewY|0vw|0vh/i;
+        // Webflow IX2 baked-transform signature: contains scale3d AND
+        // rotateX AND rotateY AND rotateZ AND skew in one value. No human
+        // and no other animation library writes this exact 6-component form.
+        const IX2_TRANSFORM_RE =
+          /scale3d\([^)]*\).*rotateX\([^)]*\).*rotateY\([^)]*\).*rotateZ\([^)]*\).*skew\(/i;
+
         const SWIPER_SEL =
           '.swiper, .swiper-wrapper, .swiper-slide, [class*="swiper-"]';
         const allEls = document.querySelectorAll<HTMLElement>('[style]');
@@ -192,27 +204,21 @@ export class Crawler {
           // breaks layout but removes leftover hints from finished animations.
           el.style.removeProperty('will-change');
 
-          // transform-style: preserve-3d is set by 3D animation libs and is
-          // safe to strip (it will be re-applied if needed).
-          if (/transform-style\s*:\s*preserve-3d/i.test(style)) {
-            el.style.removeProperty('transform-style');
-          }
-
-          // Inline transform with JS-animation signature (translate3d, matrix3d,
-          // viewport units like 0vw, etc.) is JS-injected animation state.
-          const inlineTransform = el.style.transform;
-          if (inlineTransform && ANIM_TRANSFORM_RE.test(inlineTransform)) {
-            el.style.removeProperty('transform');
-          }
-
           // Webflow IX2 marks animated elements with `data-w-id`. Anything
           // inline on those (transform/opacity/transition) is animation state.
-          if (el.hasAttribute('data-w-id')) {
+          const isIx2 = el.hasAttribute('data-w-id');
+          const inlineTransform = el.style.transform;
+          const ix2Transform =
+            !!inlineTransform && IX2_TRANSFORM_RE.test(inlineTransform);
+
+          if (isIx2 || ix2Transform) {
             el.style.removeProperty('transform');
+            el.style.removeProperty('transform-style');
             el.style.removeProperty('opacity');
             el.style.removeProperty('transition');
             el.style.removeProperty('transition-duration');
             el.style.removeProperty('transition-property');
+            el.style.removeProperty('transition-delay');
           }
 
           // Cleanup empty style attribute
