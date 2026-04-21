@@ -162,7 +162,114 @@ export class Crawler {
             el.remove();
           }
         }
+
+        // ---------------------------------------------------------------
+        // Strip JS-injected animation state from inline `style` attributes.
+        //
+        // GSAP, Webflow IX2, ScrollTrigger, Swiper, etc. inject inline
+        // `transform`, `opacity`, `will-change`, `transition-duration`
+        // continuously while the page runs. When we serialize the DOM
+        // mid-flight, these inline values persist into the static export
+        // and FREEZE the elements at whatever position they were in when
+        // we snapshotted (e.g. a 3D box rail stuck at translate3d(-130%),
+        // a swiper-wrapper offset to slide 3, a card with opacity:0 from
+        // a fade-in that never re-runs because IX2 thinks it already has).
+        //
+        // On reload the animation libs reinitialize but the conflicting
+        // inline values either fight with the lib or short-circuit it.
+        // Strip them so animations start from a clean slate.
+        // ---------------------------------------------------------------
+        const ANIM_TRANSFORM_RE =
+          /translate3d|scale3d|matrix3d|matrix\(|rotate3d|rotateX|rotateY|rotateZ|skew\(|skewX|skewY|0vw|0vh/i;
+        const SWIPER_SEL =
+          '.swiper, .swiper-wrapper, .swiper-slide, [class*="swiper-"]';
+        const allEls = document.querySelectorAll<HTMLElement>('[style]');
+        for (const el of allEls) {
+          const style = el.getAttribute('style');
+          if (!style) continue;
+
+          // will-change is purely an optimization hint; stripping it never
+          // breaks layout but removes leftover hints from finished animations.
+          el.style.removeProperty('will-change');
+
+          // transform-style: preserve-3d is set by 3D animation libs and is
+          // safe to strip (it will be re-applied if needed).
+          if (/transform-style\s*:\s*preserve-3d/i.test(style)) {
+            el.style.removeProperty('transform-style');
+          }
+
+          // Inline transform with JS-animation signature (translate3d, matrix3d,
+          // viewport units like 0vw, etc.) is JS-injected animation state.
+          const inlineTransform = el.style.transform;
+          if (inlineTransform && ANIM_TRANSFORM_RE.test(inlineTransform)) {
+            el.style.removeProperty('transform');
+          }
+
+          // Webflow IX2 marks animated elements with `data-w-id`. Anything
+          // inline on those (transform/opacity/transition) is animation state.
+          if (el.hasAttribute('data-w-id')) {
+            el.style.removeProperty('transform');
+            el.style.removeProperty('opacity');
+            el.style.removeProperty('transition');
+            el.style.removeProperty('transition-duration');
+            el.style.removeProperty('transition-property');
+          }
+
+          // Cleanup empty style attribute
+          if (!el.getAttribute('style')?.trim()) el.removeAttribute('style');
+        }
+
+        // Swiper-specific cleanup: Swiper writes inline transform/transition
+        // on .swiper-wrapper (slide offset) and .swiper-slide (per-slide
+        // transition-duration). It also adds runtime classes like
+        // swiper-initialized / swiper-slide-active that conflict with re-init.
+        for (const el of document.querySelectorAll<HTMLElement>(SWIPER_SEL)) {
+          el.style.removeProperty('transform');
+          el.style.removeProperty('transition');
+          el.style.removeProperty('transition-duration');
+          el.style.removeProperty('transition-delay');
+          if (!el.getAttribute('style')?.trim()) el.removeAttribute('style');
+          // Strip Swiper runtime state classes so re-init starts clean.
+          const runtimeClasses = [
+            'swiper-initialized',
+            'swiper-slide-active',
+            'swiper-slide-prev',
+            'swiper-slide-next',
+            'swiper-slide-duplicate-active',
+            'swiper-slide-duplicate-prev',
+            'swiper-slide-duplicate-next',
+            'swiper-slide-visible',
+            'swiper-horizontal',
+            'swiper-vertical',
+            'swiper-watch-progress',
+            'swiper-backface-hidden',
+          ];
+          for (const c of runtimeClasses) el.classList.remove(c);
+        }
+
+        // Some sites set scroll-progress driven CSS variables / inline width
+        // on progress bars (e.g. .border-grad-animation width:93.6%).
+        // These get baked in. We can't always tell which are animation-only,
+        // but if a class name suggests progress/scroll-driven, reset width.
+        const progressSel =
+          '[class*="border-grad-animation"], [class*="progress-bar"], [class*="scroll-progress"]';
+        for (const el of document.querySelectorAll<HTMLElement>(progressSel)) {
+          if (/width\s*:/i.test(el.getAttribute('style') ?? '')) {
+            el.style.removeProperty('width');
+            el.style.removeProperty('height');
+            if (!el.getAttribute('style')?.trim()) el.removeAttribute('style');
+          }
+        }
+
+        // Reset scroll position to top so any snapshot of scroll-dependent
+        // state (sticky/fixed offsets, pinned ScrollTrigger states) reflects
+        // the initial view, not the bottom of the page.
+        window.scrollTo(0, 0);
       });
+
+      // Give animation libs one tick to settle into their initial state
+      // after we wiped the inline animation values.
+      await page.waitForTimeout(300);
 
       const html = await page.content();
 
