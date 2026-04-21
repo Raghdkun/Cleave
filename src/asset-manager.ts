@@ -359,6 +359,37 @@ export class AssetManager {
     const absRe = /https?:\/\/[^\s"'`<>()]+?\.(?:m?js|css|woff2?|ttf|otf|eot|json|wasm|png|jpe?g|gif|svg|webp|avif|mp4|webm|mp3|ogg)(?:\?[^\s"'`<>()]*)?/gi;
     const relRe = /["'`](\/[^\s"'`<>()]+?\.(?:m?js|css|woff2?|ttf|otf|wasm|json|png|jpe?g|gif|svg|webp|avif))(?:\?[^\s"'`<>()]*)?["'`]/gi;
 
+    // Hosts that frequently appear as string-literal examples inside JS
+    // bundles (Framer dev tooling, GitHub assets referenced in source code,
+    // etc.) but never serve real assets we can fetch. Skip them entirely.
+    const exampleHostBlocklist = new Set([
+      'framerusercontent.com', // valid for /images/ and /assets/, but bare paths like /package.json are template strings
+      'github.com',
+      'github.githubassets.com',
+      'app.framerstatic.com', // serviceWorker.js is 403
+    ]);
+    // Paths under framerusercontent we DO want (real uploaded assets)
+    const framerUserAllowedPrefixes = ['/images/', '/assets/', '/modules/'];
+
+    const isLikelyValidAssetUrl = (raw: string): boolean => {
+      // Reject template literal placeholders (raw or URL-encoded)
+      if (raw.includes('${') || raw.includes('%7B') || raw.includes('%7b')) return false;
+      // Reject backslash-escape sequences (string literals, not real URLs)
+      if (raw.includes('\\u') || raw.includes('\\x')) return false;
+      let u: URL;
+      try { u = new URL(raw); } catch { return false; }
+      // Hostname must contain a dot AND must not look like a bare filename
+      // (e.g. "ga.js", "cdn.js" — JS variables that happened to match the regex)
+      if (!u.hostname.includes('.')) return false;
+      if (/\.(?:js|mjs|css|json|png|jpe?g|svg|gif|webp|woff2?)$/i.test(u.hostname)) return false;
+      // Block known noise hosts, with explicit allow-list for framerusercontent
+      if (u.hostname === 'framerusercontent.com') {
+        return framerUserAllowedPrefixes.some((p) => u.pathname.startsWith(p));
+      }
+      if (exampleHostBlocklist.has(u.hostname)) return false;
+      return true;
+    };
+
     for (const asset of this.assets.values()) {
       const ct = asset.mimeType.toLowerCase();
       const isJs =
@@ -380,12 +411,19 @@ export class AssetManager {
       let m: RegExpExecArray | null;
       while ((m = absRe.exec(text)) !== null) {
         const u = m[0];
-        if (!this.assets.has(u)) found.add(u);
+        if (this.assets.has(u)) continue;
+        if (!isLikelyValidAssetUrl(u)) continue;
+        found.add(u);
       }
       while ((m = relRe.exec(text)) !== null) {
+        const path = m[1];
+        // Reject template placeholders in relative paths too
+        if (path.includes('${') || path.includes('%7B') || path.includes('\\u')) continue;
         try {
-          const resolved = new URL(m[1], asset.url).toString();
-          if (!this.assets.has(resolved)) found.add(resolved);
+          const resolved = new URL(path, asset.url).toString();
+          if (this.assets.has(resolved)) continue;
+          if (!isLikelyValidAssetUrl(resolved)) continue;
+          found.add(resolved);
         } catch {
           /* ignore */
         }
