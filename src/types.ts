@@ -1,6 +1,8 @@
 export interface CrawlResult {
   html: string;
   baseUrl: string;
+  /** Asset URLs observed via the browser network panel during page load (incl. dynamic imports + lazy-loaded chunks). */
+  discoveredUrls?: string[];
 }
 
 export interface AssetRecord {
@@ -37,6 +39,8 @@ export interface PageResult {
   baseUrl: string;
   /** The local file path for this page in the ZIP (e.g., "about/index.html") */
   localPath: string;
+  /** Asset URLs observed during the browser crawl (dynamic imports, lazy chunks, fetches). */
+  discoveredUrls?: string[];
 }
 
 /** Progress status reported during multi-page crawling */

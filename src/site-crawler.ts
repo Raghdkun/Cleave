@@ -100,7 +100,7 @@ export class SiteCrawler {
     logger.info(`Crawling [depth=${depth}]: ${url}`);
 
     try {
-      const { html, baseUrl } = await this.crawler.crawlPage(url);
+      const { html, baseUrl, discoveredUrls } = await this.crawler.crawlPage(url);
       const localPath = slugifyPath(new URL(url).pathname);
 
       const normalized = this.normalizeUrl(url);
@@ -115,7 +115,7 @@ export class SiteCrawler {
       const discoveredLinks = this.extractLinks(html, baseUrl);
 
       return {
-        page: { url, html, baseUrl, localPath },
+        page: { url, html, baseUrl, localPath, discoveredUrls },
         depth,
         discoveredLinks,
       };

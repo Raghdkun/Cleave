@@ -132,12 +132,27 @@ export class AssetManager {
     return basePath;
   }
 
-  async processPage(html: string, baseUrl: string, pageLocalPath?: string): Promise<ProcessedPage> {
+  async processPage(
+    html: string,
+    baseUrl: string,
+    pageLocalPath?: string,
+    seedUrls: string[] = []
+  ): Promise<ProcessedPage> {
     this.baseUrl = baseUrl;
 
     const $ = cheerio.load(html, { xml: false } as cheerio.CheerioOptions);
 
     const urls = new Set<string>();
+
+    // Seed with URLs discovered by the browser network listener (catches dynamic
+    // imports, lazy chunks, runtime fetches that aren't in the static HTML).
+    for (const seed of seedUrls) {
+      if (!seed) continue;
+      if (SKIP_SCHEMES.some((scheme) => seed.startsWith(scheme))) continue;
+      // Only auto-include same-origin or asset-CDN URLs we can categorize
+      if (!isAbsoluteUrl(seed)) continue;
+      urls.add(seed);
+    }
 
     const collectAttr = (selector: string, attr: string): void => {
       $(selector).each((_, el) => {
@@ -230,6 +245,17 @@ export class AssetManager {
       [...urls].map(url => this.limit(() => this.downloadAsset(url)))
     );
 
+    // Scan downloaded JS bundles for additional asset URLs (e.g. lazy-loaded
+    // route chunks referenced by string literal in Framer/Webpack/Vite output).
+    // We do up to 2 passes because newly-downloaded chunks may reference more chunks.
+    for (let pass = 0; pass < 2; pass++) {
+      const newUrls = this.discoverUrlsInJsBundles(baseUrl);
+      const fresh = [...newUrls].filter((u) => !this.assets.has(u));
+      if (fresh.length === 0) break;
+      logger.info(`Pass ${pass + 1}: discovered ${fresh.length} additional asset URLs in JS bundles`);
+      await Promise.all(fresh.map((url) => this.limit(() => this.downloadAsset(url))));
+    }
+
     // Process CSS files: download referenced sub-assets
     const cssAssets = [...this.assets.values()].filter(
       a => a.mimeType.includes('css') || a.localPath.startsWith('assets/css/')
@@ -318,6 +344,54 @@ export class AssetManager {
       logger.error('Failed to download asset', { url, error: message });
       return null;
     }
+  }
+
+  /**
+   * Scan all downloaded JS bundles for additional asset URL references
+   * (lazy-loaded chunks, dynamic imports, framework route maps).
+   * Returns a Set of absolute URLs not yet downloaded.
+   */
+  private discoverUrlsInJsBundles(baseUrl: string): Set<string> {
+    const found = new Set<string>();
+    // Match common asset extensions referenced as string literals inside JS.
+    // Captures: 1) absolute URLs (https?://...) and 2) relative paths starting
+    // with / or ./ that look like build-output asset paths.
+    const absRe = /https?:\/\/[^\s"'`<>()]+?\.(?:m?js|css|woff2?|ttf|otf|eot|json|wasm|png|jpe?g|gif|svg|webp|avif|mp4|webm|mp3|ogg)(?:\?[^\s"'`<>()]*)?/gi;
+    const relRe = /["'`](\/[^\s"'`<>()]+?\.(?:m?js|css|woff2?|ttf|otf|wasm|json|png|jpe?g|gif|svg|webp|avif))(?:\?[^\s"'`<>()]*)?["'`]/gi;
+
+    for (const asset of this.assets.values()) {
+      const ct = asset.mimeType.toLowerCase();
+      const isJs =
+        ct.includes('javascript') ||
+        ct.includes('ecmascript') ||
+        asset.localPath.endsWith('.js') ||
+        asset.localPath.endsWith('.mjs');
+      if (!isJs) continue;
+
+      let text: string;
+      try {
+        text = asset.content.toString('utf-8');
+      } catch {
+        continue;
+      }
+      // Skip very large bundles to keep regex cost bounded
+      if (text.length > 5_000_000) continue;
+
+      let m: RegExpExecArray | null;
+      while ((m = absRe.exec(text)) !== null) {
+        const u = m[0];
+        if (!this.assets.has(u)) found.add(u);
+      }
+      while ((m = relRe.exec(text)) !== null) {
+        try {
+          const resolved = new URL(m[1], asset.url).toString();
+          if (!this.assets.has(resolved)) found.add(resolved);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return found;
   }
 
   rewriteHtmlPaths($: cheerio.CheerioAPI, pageLocalPath?: string): void {

@@ -46,13 +46,13 @@ async function exportSinglePage(options: MultiPageExportOptions): Promise<void> 
   // Step 2: Crawl
   logger.info('Step 1/4: Crawling page...');
   const crawler = new Crawler();
-  const { html, baseUrl } = await crawler.crawl(options.url);
+  const { html, baseUrl, discoveredUrls } = await crawler.crawl(options.url);
   logger.info('Crawl complete', { baseUrl, htmlLength: html.length });
 
   // Step 3: Download & rewrite assets
   logger.info('Step 2/4: Downloading assets...');
   const assetManager = new AssetManager();
-  const processed = await assetManager.processPage(html, baseUrl);
+  const processed = await assetManager.processPage(html, baseUrl, undefined, discoveredUrls);
   logger.info('Assets processed', { assetCount: processed.assets.size });
 
   // Step 4: Transform (clean + fix forms + inject CDNs)
@@ -111,7 +111,7 @@ async function exportMultiPage(options: MultiPageExportOptions): Promise<void> {
   let sharedAssets = new Map<string, AssetRecord>();
 
   for (const page of pages) {
-    const processed = await assetManager.processPage(page.html, page.baseUrl, page.localPath);
+    const processed = await assetManager.processPage(page.html, page.baseUrl, page.localPath, page.discoveredUrls);
     processedPages.push({ localPath: page.localPath, html: processed.html, baseUrl: page.baseUrl });
     sharedAssets = processed.assets;
   }
