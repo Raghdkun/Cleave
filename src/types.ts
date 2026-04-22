@@ -27,7 +27,12 @@ export interface ExportOptions {
   url: string;
   output?: string;
   webhookUrl?: string;
+  /** Output format: html (default), react (Next.js project), or both. */
+  format?: ExportFormat;
 }
+
+/** Output format selector. `both` writes <output>.zip and <output>-react.zip side-by-side. */
+export type ExportFormat = 'html' | 'react' | 'both';
 
 /** Result for a single crawled page in multi-page mode */
 export interface PageResult {

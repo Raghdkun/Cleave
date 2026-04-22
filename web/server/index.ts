@@ -22,9 +22,12 @@ interface Job {
   status: 'processing' | 'complete' | 'error';
   logs: string[];
   outputPath: string;
+  reactPath: string;
+  format: 'html' | 'react' | 'both';
   process: ChildProcess | null;
   createdAt: number;
   fileSize?: number;
+  reactFileSize?: number;
   pages?: number;
   assets?: number;
 }
@@ -38,6 +41,7 @@ setInterval(() => {
     if (now - job.createdAt > 30 * 60 * 1000) {
       if (job.process) job.process.kill();
       unlink(job.outputPath).catch(() => {});
+      unlink(job.reactPath).catch(() => {});
       jobs.delete(id);
     }
   }
@@ -61,7 +65,12 @@ if (process.env.NODE_ENV === 'production') {
 // ---------------------------------------------------------------------------
 
 app.post('/api/export', (req, res) => {
-  const { url, depth = 0, maxPages = 50, concurrency = 3 } = req.body;
+  const { url, depth = 0, maxPages = 50, concurrency = 3, format = 'html' } = req.body;
+
+  if (!['html', 'react', 'both'].includes(format)) {
+    res.status(400).json({ error: "format must be 'html', 'react', or 'both'" });
+    return;
+  }
 
   // Basic URL validation
   try {
@@ -77,11 +86,13 @@ app.post('/api/export', (req, res) => {
 
   const jobId = randomUUID();
   const outputPath = path.join(os.tmpdir(), `cleave-${jobId}.zip`);
+  const reactPath = path.join(os.tmpdir(), `cleave-${jobId}-react.zip`);
 
   const args = ['tsx', 'src/index.ts', url, '-o', outputPath];
   if (depth > 0) args.push('-d', String(depth));
   args.push('-c', String(concurrency));
   args.push('-m', String(maxPages));
+  args.push('-f', format);
 
   const job: Job = {
     id: jobId,
@@ -89,6 +100,8 @@ app.post('/api/export', (req, res) => {
     status: 'processing',
     logs: [],
     outputPath,
+    reactPath,
+    format: format as 'html' | 'react' | 'both',
     process: null,
     createdAt: Date.now(),
   };
@@ -129,11 +142,21 @@ app.post('/api/export', (req, res) => {
     job.process = null;
 
     if (code === 0) {
-      try {
-        const stats = await stat(outputPath);
-        job.fileSize = stats.size;
-      } catch {
-        /* file may not exist if something went wrong */
+      if (job.format === 'html' || job.format === 'both') {
+        try {
+          const stats = await stat(outputPath);
+          job.fileSize = stats.size;
+        } catch {
+          /* file may not exist if something went wrong */
+        }
+      }
+      if (job.format === 'react' || job.format === 'both') {
+        try {
+          const stats = await stat(reactPath);
+          job.reactFileSize = stats.size;
+        } catch {
+          /* file may not exist */
+        }
       }
     }
   });
@@ -165,7 +188,7 @@ app.get('/api/export/:id/progress', (req, res) => {
   // If already finished, send result immediately
   if (job.status === 'complete') {
     res.write(
-      `data: ${JSON.stringify({ type: 'complete', fileSize: job.fileSize, pages: job.pages, assets: job.assets })}\n\n`,
+      `data: ${JSON.stringify({ type: 'complete', fileSize: job.fileSize, reactFileSize: job.reactFileSize, format: job.format, pages: job.pages, assets: job.assets })}\n\n`,
     );
     res.end();
     return;
@@ -187,7 +210,7 @@ app.get('/api/export/:id/progress', (req, res) => {
 
     if (job.status === 'complete') {
       res.write(
-        `data: ${JSON.stringify({ type: 'complete', fileSize: job.fileSize, pages: job.pages, assets: job.assets })}\n\n`,
+        `data: ${JSON.stringify({ type: 'complete', fileSize: job.fileSize, reactFileSize: job.reactFileSize, format: job.format, pages: job.pages, assets: job.assets })}\n\n`,
       );
       clearInterval(interval);
       res.end();
@@ -215,11 +238,15 @@ app.get('/api/export/:id/download', (req, res) => {
     return;
   }
 
+  const variant = (req.query.format as string) === 'react' ? 'react' : 'html';
+  const filePath = variant === 'react' ? job.reactPath : job.outputPath;
+  const suffix = variant === 'react' ? '-react' : '';
+
   try {
     const hostname = new URL(job.url).hostname;
-    res.download(job.outputPath, `${hostname}.zip`);
+    res.download(filePath, `${hostname}${suffix}.zip`);
   } catch {
-    res.download(job.outputPath, 'export.zip');
+    res.download(filePath, `export${suffix}.zip`);
   }
 });
 
@@ -241,6 +268,7 @@ app.delete('/api/export/:id', (req, res) => {
   job.status = 'error';
 
   unlink(job.outputPath).catch(() => {});
+  unlink(job.reactPath).catch(() => {});
   res.json({ success: true });
 });
 

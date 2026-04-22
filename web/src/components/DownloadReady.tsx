@@ -1,10 +1,13 @@
 import { motion } from 'framer-motion';
-import { Download, FileArchive, Layers, Image, RotateCcw, Check } from 'lucide-react';
+import { Download, FileArchive, Layers, Image, RotateCcw, Check, Code2, FileCode } from 'lucide-react';
 import { GlassCard } from './GlassCard';
+import type { ExportFormat } from '../hooks/useExport';
 
 interface DownloadReadyProps {
   jobId: string;
   fileSize: number;
+  reactFileSize?: number;
+  format: ExportFormat;
   pages?: number;
   assets?: number;
   onReset: () => void;
@@ -16,10 +19,17 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-export function DownloadReady({ jobId, fileSize, pages, assets, onReset }: DownloadReadyProps) {
-  const handleDownload = () => {
-    window.location.href = `/api/export/${jobId}/download`;
+export function DownloadReady({ jobId, fileSize, reactFileSize, format, pages, assets, onReset }: DownloadReadyProps) {
+  const downloadHtml = () => {
+    window.location.href = `/api/export/${jobId}/download?format=html`;
   };
+  const downloadReact = () => {
+    window.location.href = `/api/export/${jobId}/download?format=react`;
+  };
+
+  const showHtml = format === 'html' || format === 'both';
+  const showReact = format === 'react' || format === 'both';
+  const totalSize = (showHtml ? fileSize : 0) + (showReact ? reactFileSize ?? 0 : 0);
 
   const stats = [
     pages != null && pages > 0 && {
@@ -36,8 +46,8 @@ export function DownloadReady({ jobId, fileSize, pages, assets, onReset }: Downl
     },
     {
       icon: FileArchive,
-      value: formatSize(fileSize),
-      label: 'File Size',
+      value: formatSize(totalSize),
+      label: format === 'both' ? 'Total Size' : 'File Size',
       color: 'text-pink-400',
     },
   ].filter(Boolean) as Array<{ icon: typeof Layers; value: string; label: string; color: string }>;
@@ -81,16 +91,41 @@ export function DownloadReady({ jobId, fileSize, pages, assets, onReset }: Downl
           ))}
         </div>
 
-        {/* Download button */}
-        <motion.button
-          onClick={handleDownload}
-          className="w-full py-4 bg-gradient-to-r from-violet-600 to-cyan-500 hover:from-violet-500 hover:to-cyan-400 text-white font-semibold rounded-xl transition-all flex items-center justify-center gap-2 text-lg mb-4 cursor-pointer"
-          whileHover={{ scale: 1.02 }}
-          whileTap={{ scale: 0.98 }}
-        >
-          <Download className="w-5 h-5" />
-          Download ZIP
-        </motion.button>
+        {/* Download buttons — one or two depending on format */}
+        <div className={`grid ${format === 'both' ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'} gap-3 mb-4`}>
+          {showHtml && (
+            <motion.button
+              onClick={downloadHtml}
+              className="py-4 bg-gradient-to-r from-violet-600 to-cyan-500 hover:from-violet-500 hover:to-cyan-400 text-white font-semibold rounded-xl transition-all flex items-center justify-center gap-2 text-base cursor-pointer"
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
+            >
+              <FileCode className="w-5 h-5" />
+              <span>HTML</span>
+              <span className="text-xs font-normal text-white/70">({formatSize(fileSize)})</span>
+              <Download className="w-4 h-4 ml-1" />
+            </motion.button>
+          )}
+          {showReact && (
+            <motion.button
+              onClick={downloadReact}
+              className={`py-4 ${
+                format === 'both'
+                  ? 'bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.1] text-white'
+                  : 'bg-gradient-to-r from-violet-600 to-cyan-500 hover:from-violet-500 hover:to-cyan-400 text-white'
+              } font-semibold rounded-xl transition-all flex items-center justify-center gap-2 text-base cursor-pointer`}
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
+            >
+              <Code2 className="w-5 h-5" />
+              <span>React (Next.js)</span>
+              {reactFileSize ? (
+                <span className="text-xs font-normal text-white/70">({formatSize(reactFileSize)})</span>
+              ) : null}
+              <Download className="w-4 h-4 ml-1" />
+            </motion.button>
+          )}
+        </div>
 
         {/* Export another */}
         <button

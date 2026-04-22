@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
 import type { AssetRecord } from './types.js';
+import type { ReactProjectFile } from './react-converter/index.js';
 import { logger } from './utils/logger.js';
 
 const README_TXT = `Cleave - Exported Website
@@ -164,6 +165,43 @@ export async function bundleSite(
     pages: pages.length,
     assets: assets.size,
     totalFiles,
+    size: `${(zipBuffer.length / 1024).toFixed(1)} KB`,
+  });
+
+  return zipBuffer;
+}
+
+/**
+ * Bundles a generated React/Next.js project (source files + assets under /public)
+ * into a standalone ZIP. The output is ready to `npm install && npm run dev` after
+ * unzipping. No launcher scripts are added — Next.js owns the dev server.
+ */
+export async function bundleReact(files: ReactProjectFile[]): Promise<Buffer> {
+  const zip = new JSZip();
+
+  let textFiles = 0;
+  let binaryFiles = 0;
+  for (const file of files) {
+    if (typeof file.content === 'string') {
+      zip.file(file.path, file.content);
+      textFiles++;
+    } else {
+      zip.file(file.path, file.content, { binary: true });
+      binaryFiles++;
+    }
+  }
+
+  const zipBuffer = await zip.generateAsync({
+    type: 'nodebuffer',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 },
+    platform: 'UNIX',
+  });
+
+  logger.info('React project ZIP created', {
+    sourceFiles: textFiles,
+    assetFiles: binaryFiles,
+    totalFiles: files.length,
     size: `${(zipBuffer.length / 1024).toFixed(1)} KB`,
   });
 

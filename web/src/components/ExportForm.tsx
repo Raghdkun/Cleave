@@ -1,10 +1,14 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { Globe, ChevronDown, Zap } from 'lucide-react';
+import { Globe, ChevronDown, Zap, Code2, FileCode, Layers } from 'lucide-react';
 import { GlassCard } from './GlassCard';
+import type { ExportFormat } from '../hooks/useExport';
 
 interface ExportFormProps {
-  onSubmit: (url: string, options: { depth: number; maxPages: number; concurrency: number }) => void;
+  onSubmit: (
+    url: string,
+    options: { depth: number; maxPages: number; concurrency: number; format: ExportFormat },
+  ) => void;
 }
 
 export function ExportForm({ onSubmit }: ExportFormProps) {
@@ -13,11 +17,12 @@ export function ExportForm({ onSubmit }: ExportFormProps) {
   const [depth, setDepth] = useState(0);
   const [maxPages, setMaxPages] = useState(50);
   const [concurrency, setConcurrency] = useState(3);
+  const [format, setFormat] = useState<ExportFormat>('html');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!url.trim()) return;
-    onSubmit(url.trim(), { depth, maxPages, concurrency });
+    onSubmit(url.trim(), { depth, maxPages, concurrency, format });
   };
 
   return (
@@ -93,6 +98,35 @@ export function ExportForm({ onSubmit }: ExportFormProps) {
               <Zap className="w-5 h-5" />
               Export
             </motion.button>
+          </div>
+
+          {/* Format selector — pick output kind */}
+          <div className="mt-4 grid grid-cols-3 gap-2">
+            {(
+              [
+                { value: 'html', label: 'HTML', desc: 'Static site', Icon: FileCode },
+                { value: 'react', label: 'React', desc: 'Next.js app', Icon: Code2 },
+                { value: 'both', label: 'Both', desc: 'Get both ZIPs', Icon: Layers },
+              ] as const
+            ).map(({ value, label, desc, Icon }) => {
+              const active = format === value;
+              return (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setFormat(value)}
+                  className={`p-3 rounded-xl border transition-all flex flex-col items-center gap-1 cursor-pointer ${
+                    active
+                      ? 'bg-gradient-to-br from-violet-600/30 to-cyan-500/20 border-violet-400/50 text-white'
+                      : 'bg-white/[0.04] border-white/[0.08] text-white/60 hover:bg-white/[0.07] hover:text-white/80'
+                  }`}
+                >
+                  <Icon className="w-4 h-4" />
+                  <span className="text-sm font-semibold">{label}</span>
+                  <span className="text-[10px] text-white/40">{desc}</span>
+                </button>
+              );
+            })}
           </div>
 
           {/* Advanced Options Toggle */}

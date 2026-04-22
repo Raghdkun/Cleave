@@ -34,6 +34,8 @@ export default function App() {
               key="download"
               jobId={state.jobId}
               fileSize={state.fileSize}
+              reactFileSize={state.reactFileSize}
+              format={state.format}
               pages={state.pages}
               assets={state.assets}
               onReset={reset}

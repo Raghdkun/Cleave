@@ -1,13 +1,15 @@
 import { writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { Crawler } from './crawler.js';
 import { AssetManager } from './asset-manager.js';
 import { transform, detectPackages } from './transformer/index.js';
-import { bundle, bundleSite } from './bundler.js';
+import { bundle, bundleSite, bundleReact } from './bundler.js';
 import { SiteCrawler } from './site-crawler.js';
 import { remapLinks } from './link-mapper.js';
+import { convertToReact } from './react-converter/index.js';
 import { isSafeUrl } from './utils/url-validator.js';
 import { logger } from './utils/logger.js';
-import type { MultiPageExportOptions, AssetRecord } from './types.js';
+import type { MultiPageExportOptions, AssetRecord, ExportFormat } from './types.js';
 
 function parseArgs(): MultiPageExportOptions {
   const args = process.argv.slice(2);
@@ -17,6 +19,7 @@ function parseArgs(): MultiPageExportOptions {
   let maxDepth = 0;
   let concurrency = 3;
   let maxPages = 50;
+  let format: ExportFormat = 'html';
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--output' || args[i] === '-o') {
@@ -29,20 +32,31 @@ function parseArgs(): MultiPageExportOptions {
       concurrency = parseInt(args[++i], 10);
     } else if (args[i] === '--max-pages' || args[i] === '-m') {
       maxPages = parseInt(args[++i], 10);
+    } else if (args[i] === '--format' || args[i] === '-f') {
+      const v = (args[++i] ?? '').toLowerCase();
+      if (v !== 'html' && v !== 'react' && v !== 'both') {
+        console.error(`Invalid --format value: ${v}. Expected html | react | both.`);
+        process.exit(1);
+      }
+      format = v;
     } else if (!args[i].startsWith('-')) {
       url = args[i];
     }
   }
 
   if (!url) {
-    console.error('Usage: website-exporter <url> [--output/-o <file>] [--webhook/-w <url>] [--depth/-d <n>] [--concurrency/-c <n>] [--max-pages/-m <n>]');
+    console.error(
+      'Usage: website-exporter <url> [--output/-o <file>] [--format/-f html|react|both] [--webhook/-w <url>] [--depth/-d <n>] [--concurrency/-c <n>] [--max-pages/-m <n>]',
+    );
     process.exit(1);
   }
 
-  return { url, output, webhookUrl, maxDepth, concurrency, maxPages };
+  return { url, output, webhookUrl, maxDepth, concurrency, maxPages, format };
 }
 
 async function exportSinglePage(options: MultiPageExportOptions): Promise<void> {
+  const format: ExportFormat = options.format ?? 'html';
+
   // Step 2: Crawl
   logger.info('Step 1/4: Crawling page...');
   const crawler = new Crawler();
@@ -66,18 +80,47 @@ async function exportSinglePage(options: MultiPageExportOptions): Promise<void> 
     assets: processed.assets,
   });
 
-  // Step 5: Bundle into ZIP
+  // Step 5: Bundle into ZIP(s)
   logger.info('Step 4/4: Bundling ZIP...');
-  const zipBuffer = await bundle(cleanHtml, processed.assets);
-
-  // Step 6: Write to disk
   const outputPath = options.output ?? 'export.zip';
-  await writeFile(outputPath, zipBuffer);
-  logger.info(`Export complete! Saved to ${outputPath}`, {
-    size: `${(zipBuffer.length / 1024 / 1024).toFixed(2)} MB`,
-    assets: processed.assets.size,
-  });
-  logger.info('IMPORTANT: unzip then run start.sh (mac/linux) or start.bat (windows). Do NOT open index.html via file:// - browsers block ES modules over file://, which breaks scroll animations and the JS runtime.');
+
+  if (format === 'html' || format === 'both') {
+    const zipBuffer = await bundle(cleanHtml, processed.assets);
+    await writeFile(outputPath, zipBuffer);
+    logger.info(`HTML export complete! Saved to ${outputPath}`, {
+      size: `${(zipBuffer.length / 1024 / 1024).toFixed(2)} MB`,
+      assets: processed.assets.size,
+    });
+  }
+
+  if (format === 'react' || format === 'both') {
+    const reactFiles = convertToReact({
+      sourceUrl: baseUrl,
+      html: cleanHtml,
+      assets: processed.assets,
+    });
+    const reactZipBuffer = await bundleReact(reactFiles);
+    const reactPath = format === 'both' ? withSuffix(outputPath, '-react') : outputPath;
+    await writeFile(reactPath, reactZipBuffer);
+    logger.info(`React export complete! Saved to ${reactPath}`, {
+      size: `${(reactZipBuffer.length / 1024 / 1024).toFixed(2)} MB`,
+      files: reactFiles.length,
+    });
+  }
+
+  if (format === 'html' || format === 'both') {
+    logger.info('IMPORTANT: unzip then run start.sh (mac/linux) or start.bat (windows). Do NOT open index.html via file:// - browsers block ES modules over file://, which breaks scroll animations and the JS runtime.');
+  }
+  if (format === 'react' || format === 'both') {
+    logger.info('React project: unzip the React ZIP, then `npm install && npm run dev` (Next.js).');
+  }
+}
+
+/** Inserts a suffix before the file extension. `withSuffix('a/b.zip','-react') === 'a/b-react.zip'` */
+function withSuffix(filePath: string, suffix: string): string {
+  const ext = path.extname(filePath);
+  const base = filePath.slice(0, filePath.length - ext.length);
+  return `${base}${suffix}${ext}`;
 }
 
 async function exportMultiPage(options: MultiPageExportOptions): Promise<void> {
@@ -165,6 +208,9 @@ async function main(): Promise<void> {
   const maxDepth = options.maxDepth ?? 0;
 
   if (maxDepth > 0) {
+    if (options.format && options.format !== 'html') {
+      logger.warn('--format=react|both is currently single-page only; falling back to HTML for multi-page export.');
+    }
     await exportMultiPage(options);
   } else {
     await exportSinglePage(options);

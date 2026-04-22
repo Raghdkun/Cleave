@@ -1,15 +1,26 @@
 import { useState, useCallback, useRef } from 'react';
 
+export type ExportFormat = 'html' | 'react' | 'both';
+
 export type AppState =
   | { status: 'idle' }
   | { status: 'processing'; jobId: string; url: string }
-  | { status: 'complete'; jobId: string; fileSize: number; pages?: number; assets?: number }
+  | {
+      status: 'complete';
+      jobId: string;
+      fileSize: number;
+      reactFileSize?: number;
+      format: ExportFormat;
+      pages?: number;
+      assets?: number;
+    }
   | { status: 'error'; message: string };
 
 interface ExportOptions {
   depth: number;
   maxPages: number;
   concurrency: number;
+  format: ExportFormat;
 }
 
 export function useExport() {
@@ -51,6 +62,8 @@ export function useExport() {
               status: 'complete',
               jobId,
               fileSize: data.fileSize || 0,
+              reactFileSize: data.reactFileSize,
+              format: (data.format as ExportFormat) || 'html',
               pages: data.pages,
               assets: data.assets,
             });
