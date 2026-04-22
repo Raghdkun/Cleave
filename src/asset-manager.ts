@@ -92,6 +92,19 @@ const HOST_PATH_DENY_REGEX: Record<string, RegExp> = {
   'uploads-ssl.webflow.com': /^\/[a-f0-9]{20,}\/(?:fonts|images|videos|documents)\//i,
 };
 
+// Generic path denylist applied to ANY host. Use for path patterns that
+// always identify runtime API endpoints (not static assets) regardless of
+// origin: GraphQL endpoints, REST CMS APIs, Webflow editor RPCs, etc.
+// These are triggered by hydration scripts and always need a logged-in
+// session or specific headers we can't replicate.
+const GENERIC_PATH_DENY_REGEX: RegExp[] = [
+  /\/\.wf_graphql\//i, // Webflow runtime GraphQL/Apollo endpoints
+  /\/__webflow\//i, // Webflow editor RPC
+  /\/wp-admin\/admin-ajax\.php/i, // WordPress AJAX
+  /\/wp-json\//i, // WordPress REST API
+  /\/api\/auth\//i, // Auth callbacks
+];
+
 export function isLikelyAssetUrl(raw: string): boolean {
   // Reject template literal placeholders (raw or URL-encoded)
   if (raw.includes('${') || raw.includes('%7B') || raw.includes('%7b')) return false;
@@ -110,6 +123,10 @@ export function isLikelyAssetUrl(raw: string): boolean {
   // Host-specific path denylist (negative match)
   const deny = HOST_PATH_DENY_REGEX[u.hostname];
   if (deny && deny.test(u.pathname)) return false;
+  // Generic path denylist (runtime API endpoints, not static assets)
+  for (const pattern of GENERIC_PATH_DENY_REGEX) {
+    if (pattern.test(u.pathname)) return false;
+  }
   return true;
 }
 
@@ -812,108 +829,61 @@ export class AssetManager {
     const cssRecord = this.assets.get(cssUrl);
     const cssLocalDir = cssRecord ? cssRecord.localPath.split('/').slice(0, -1).join('/') : 'assets/css';
 
-    // Handle url() in declarations
+    // PASS 1 (discovery only — DO NOT mutate the tree yet):
+    // Walk all url() references and queue any whose resolved absolute URL
+    // hasn't been downloaded. We must read URLs in their ORIGINAL form here;
+    // mutating to relative paths first would cause a follow-up walk to
+    // resolve `../fonts/X.woff2` against `cssUrl=googleapis.com/css?...`
+    // and produce bogus URLs like `googleapis.com/fonts/X.woff2`.
+    const toDownload = new Set<string>();
     root.walkDecls(decl => {
       if (!decl.value.includes('url(')) return;
-
-      const parsed = valueParser(decl.value);
-
-      parsed.walk(node => {
-        if (node.type !== 'function' || node.value !== 'url') return;
-
-        const firstChild = node.nodes?.[0];
-        if (!firstChild) return;
-
-        let urlValue = '';
-        if (firstChild.type === 'string') {
-          urlValue = firstChild.value;
-        } else if (firstChild.type === 'word') {
-          urlValue = firstChild.value;
-        } else {
-          return;
-        }
-
-        if (urlValue.startsWith('data:')) return;
-        if (urlValue.startsWith('blob:')) return;
-
-        const resolvedUrl = resolveUrl(urlValue, cssUrl);
-        if (!resolvedUrl || !isAbsoluteUrl(resolvedUrl)) return;
-
-        const record = this.assets.get(resolvedUrl);
-        if (record) {
-          firstChild.value = posix.relative(cssLocalDir, record.localPath);
-          if (firstChild.type === 'string') {
-            firstChild.quote = "'";
-          }
-        }
-      });
-
-      decl.value = valueParser.stringify(parsed.nodes);
-    });
-
-    // Second pass: download url() assets that weren't already downloaded
-    const urlDownloads: Array<{ resolvedUrl: string }> = [];
-    root.walkDecls(decl => {
-      if (!decl.value.includes('url(')) return;
-
       const parsed = valueParser(decl.value);
       parsed.walk(node => {
         if (node.type !== 'function' || node.value !== 'url') return;
         const firstChild = node.nodes?.[0];
         if (!firstChild) return;
-
         let urlValue = '';
         if (firstChild.type === 'string') urlValue = firstChild.value;
         else if (firstChild.type === 'word') urlValue = firstChild.value;
         else return;
-
         if (urlValue.startsWith('data:') || urlValue.startsWith('blob:')) return;
-
         const resolvedUrl = resolveUrl(urlValue, cssUrl);
         if (!resolvedUrl || !isAbsoluteUrl(resolvedUrl)) return;
-        if (!this.assets.has(resolvedUrl)) {
-          urlDownloads.push({ resolvedUrl });
-        }
+        if (!this.assets.has(resolvedUrl)) toDownload.add(resolvedUrl);
       });
     });
 
-    if (urlDownloads.length > 0) {
+    if (toDownload.size > 0) {
       await Promise.all(
-        urlDownloads.map(({ resolvedUrl }) => this.limit(() => this.downloadAsset(resolvedUrl)))
+        [...toDownload].map(u => this.limit(() => this.downloadAsset(u)))
       );
-
-      // Rewrite again after downloading
-      root.walkDecls(decl => {
-        if (!decl.value.includes('url(')) return;
-
-        const parsed = valueParser(decl.value);
-        parsed.walk(node => {
-          if (node.type !== 'function' || node.value !== 'url') return;
-          const firstChild = node.nodes?.[0];
-          if (!firstChild) return;
-
-          let urlValue = '';
-          if (firstChild.type === 'string') urlValue = firstChild.value;
-          else if (firstChild.type === 'word') urlValue = firstChild.value;
-          else return;
-
-          if (urlValue.startsWith('data:') || urlValue.startsWith('blob:')) return;
-
-          const resolvedUrl = resolveUrl(urlValue, cssUrl);
-          if (!resolvedUrl || !isAbsoluteUrl(resolvedUrl)) return;
-
-          const record = this.assets.get(resolvedUrl);
-          if (record) {
-            firstChild.value = posix.relative(cssLocalDir, record.localPath);
-            if (firstChild.type === 'string') {
-              firstChild.quote = "'";
-            }
-          }
-        });
-
-        decl.value = valueParser.stringify(parsed.nodes);
-      });
     }
+
+    // PASS 2 (rewrite only): now that everything we'll ever have is downloaded,
+    // rewrite each url() ONCE to its local relative path (or leave alone if
+    // download failed / was filtered).
+    root.walkDecls(decl => {
+      if (!decl.value.includes('url(')) return;
+      const parsed = valueParser(decl.value);
+      parsed.walk(node => {
+        if (node.type !== 'function' || node.value !== 'url') return;
+        const firstChild = node.nodes?.[0];
+        if (!firstChild) return;
+        let urlValue = '';
+        if (firstChild.type === 'string') urlValue = firstChild.value;
+        else if (firstChild.type === 'word') urlValue = firstChild.value;
+        else return;
+        if (urlValue.startsWith('data:') || urlValue.startsWith('blob:')) return;
+        const resolvedUrl = resolveUrl(urlValue, cssUrl);
+        if (!resolvedUrl || !isAbsoluteUrl(resolvedUrl)) return;
+        const record = this.assets.get(resolvedUrl);
+        if (!record) return;
+        firstChild.value = encodeLocalUrl(posix.relative(cssLocalDir, record.localPath));
+        if (firstChild.type === 'string') firstChild.quote = "'";
+      });
+      decl.value = valueParser.stringify(parsed.nodes);
+    });
 
     return root.toString();
   }
