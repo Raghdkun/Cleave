@@ -113,9 +113,10 @@ Assets are categorized by file extension and content type. Filenames are preserv
 
 ### Webflow
 
-- `data-wf-*`, `data-w-id`, `data-wf-domain`, `data-wf-page`, `data-wf-site` attributes
-- Scripts with `webflow` in source URL or inline content
 - `.w-webflow-badge` elements
+
+Webflow runtime attributes and scripts are preserved so IX2 interactions,
+component state, and layout initialization can still run in the export.
 
 ### Wix
 

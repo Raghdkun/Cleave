@@ -13,6 +13,7 @@ import {
   pageTsx,
   sectionTsx,
   GLOBALS_CSS,
+  SITE_BOOTSTRAP_TSX,
   type NextProjectMeta,
 } from './templates.js';
 
@@ -102,6 +103,9 @@ export function convertToReact(opts: ConvertOptions): ReactProjectFile[] {
   files.push({ path: 'app/layout.tsx', content: layoutTsx(meta) });
   files.push({ path: 'app/page.tsx', content: pageTsx(meta) });
   files.push({ path: 'app/globals.css', content: GLOBALS_CSS });
+
+  // Client bootstrap (hoists original <head> + body scripts after hydration)
+  files.push({ path: 'components/_bootstrap.tsx', content: SITE_BOOTSTRAP_TSX });
 
   // Section components
   for (const section of split.sections) {

@@ -1,0 +1,128 @@
+// Cleave database schema
+// Auth (GitHub OAuth + email/password) + Plans + Users + Billing + Usage
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum SubscriptionStatus {
+  NONE
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+}
+
+model Plan {
+  id                   String   @id @default(cuid())
+  slug                 String   @unique
+  name                 String
+  tagline              String?
+  priceMonthly         Int      @default(0)
+  priceYearly          Int      @default(0)
+  stripeMonthlyPriceId String?
+  stripeYearlyPriceId  String?
+  maxExportsPerMonth   Int      @default(3)
+  maxPagesPerCrawl     Int      @default(1)
+  allowReact           Boolean  @default(false)
+  allowApi             Boolean  @default(false)
+  seats                Int      @default(1)
+  features             String[] @default([])
+  highlight            Boolean  @default(false)
+  visible              Boolean  @default(true)
+  sortOrder            Int      @default(0)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  users                User[]
+}
+
+model User {
+  id                   String              @id @default(cuid())
+  githubId             String?             @unique
+  email                String?             @unique
+  passwordHash         String?
+  login                String
+  name                 String?
+  avatarUrl            String?
+  emailVerified        Boolean             @default(false)
+  role                 Role                @default(USER)
+  planId               String?
+  plan                 Plan?               @relation(fields: [planId], references: [id])
+  stripeCustomerId     String?             @unique
+  stripeSubscriptionId String?             @unique
+  subscriptionStatus   SubscriptionStatus  @default(NONE)
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean             @default(false)
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  lastLoginAt          DateTime?
+  sessions             Session[]
+  exports              ExportJob[]
+  feedback             Feedback[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  @@index([userId])
+}
+
+model ExportJob {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  url       String
+  format    String   @default("html")
+  pages     Int      @default(0)
+  bytes     Int      @default(0)
+  status    String   @default("processing")
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+enum FeedbackKind {
+  BUG
+  FEATURE
+  GENERAL
+}
+
+enum FeedbackStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED
+  CLOSED
+}
+
+model Feedback {
+  id        String         @id @default(cuid())
+  kind      FeedbackKind   @default(BUG)
+  subject   String
+  message   String
+  email     String?
+  url       String?
+  source    String?        // 'app' | 'download' | 'export'
+  userAgent String?
+  userId    String?
+  user      User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+  status    FeedbackStatus @default(OPEN)
+  createdAt DateTime       @default(now())
+
+  @@index([status, createdAt])
+  @@index([userId])
+}

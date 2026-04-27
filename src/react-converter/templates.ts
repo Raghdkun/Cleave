@@ -161,9 +161,13 @@ keeps working unchanged.
 `;
 
 /**
- * layout.tsx — renders <html><head>{originalHeadHtml}</head><body class="..." data-...>{children}</body></html>.
- * `suppressHydrationWarning` is added because Webflow's inline JS often mutates
- * documentElement classes (e.g. `w-mod-js`, `w-mod-touch`) before React hydrates.
+ * layout.tsx — server component that renders the document shell. The original
+ * <head> children and body-level <script>/<noscript>/<style> tags are passed as
+ * raw strings into <SiteBootstrap />, a CLIENT component that injects them via
+ * useEffect AFTER hydration. This avoids React hydration mismatches (#418/#425)
+ * caused by mutating the DOM before React reconciles it, and lets the original
+ * scripts (jQuery, webflow.js, GA, IX2, swiper) load and execute against the
+ * fully-rendered section DOM.
  */
 export function layoutTsx(meta: NextProjectMeta): string {
   const bodyAttrLines = Object.entries(meta.bodyAttrs)
@@ -172,6 +176,7 @@ export function layoutTsx(meta: NextProjectMeta): string {
 
   return `import type { Metadata } from 'next';
 import './globals.css';
+import { SiteBootstrap } from '@/components/_bootstrap';
 
 export const metadata: Metadata = {
   title: ${JSON.stringify(meta.title || safeProjectName(meta.hostname))},
@@ -186,45 +191,129 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <head>
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <link rel="cleave-head-marker" data-cleave="true" />
       </head>
       <body
         className=${JSON.stringify(meta.bodyClass)}
         suppressHydrationWarning${bodyAttrLines ? '\n' + bodyAttrLines : ''}
       >
-        {/* Original <head> contents (links, inline styles, inline scripts) re-emitted
-            in <body> via a hidden marker + script that hoists them to <head> on first paint.
-            This keeps Next.js's <head> management intact while preserving every original tag. */}
-        <div
-          data-cleave-head-html
-          style={{ display: 'none' }}
-          dangerouslySetInnerHTML={{ __html: HEAD_HTML }}
-        />
-        <script
-          dangerouslySetInnerHTML={{
-            __html: \`(function(){var s=document.querySelector('[data-cleave-head-html]');if(!s)return;var nodes=Array.from(s.childNodes);var head=document.head;nodes.forEach(function(n){if(n.nodeType===1){var tag=n.tagName.toLowerCase();if(tag==='script'){var ns=document.createElement('script');for(var i=0;i<n.attributes.length;i++){var a=n.attributes[i];ns.setAttribute(a.name,a.value);}ns.text=n.textContent||'';head.appendChild(ns);}else{head.appendChild(n.cloneNode(true));}}});s.parentNode.removeChild(s);})();\`,
-          }}
-        />
         {children}
-        {/* Body-level scripts from the original page (webflow.js, jquery, GA, etc.).
-            They are mounted after the section components so they can find the DOM
-            they expect (IX2 lookups, swiper init, form bindings). */}
-        <div
-          data-cleave-body-scripts
-          style={{ display: 'none' }}
-          dangerouslySetInnerHTML={{ __html: BODY_SCRIPTS_HTML }}
-        />
-        <script
-          dangerouslySetInnerHTML={{
-            __html: \`(function(){var s=document.querySelector('[data-cleave-body-scripts]');if(!s)return;var nodes=Array.from(s.childNodes);var body=document.body;nodes.forEach(function(n){if(n.nodeType===1){var tag=n.tagName.toLowerCase();if(tag==='script'){var ns=document.createElement('script');for(var i=0;i<n.attributes.length;i++){var a=n.attributes[i];ns.setAttribute(a.name,a.value);}ns.text=n.textContent||'';body.appendChild(ns);}else{body.appendChild(n.cloneNode(true));}}});s.parentNode.removeChild(s);})();\`,
-          }}
-        />
+        <SiteBootstrap headHtml={HEAD_HTML} bodyScriptsHtml={BODY_SCRIPTS_HTML} />
       </body>
     </html>
   );
 }
 `;
 }
+
+/**
+ * SiteBootstrap.tsx — client component, renders nothing. On mount it parses
+ * the captured HEAD_HTML and BODY_SCRIPTS_HTML strings and appends each node
+ * to document.head / document.body, recreating <script> elements via
+ * document.createElement so the browser actually executes them. Runs once and
+ * exits early on subsequent mounts (HMR / fast-refresh safety).
+ */
+export const SITE_BOOTSTRAP_TSX = `'use client';
+
+import { useEffect } from 'react';
+
+interface SiteBootstrapProps {
+  headHtml: string;
+  bodyScriptsHtml: string;
+}
+
+declare global {
+  interface Window {
+    __cleaveBootstrapped?: boolean;
+  }
+}
+
+/**
+ * Clones a node into a target parent, recreating <script> elements via
+ * document.createElement so the browser actually executes them. For external
+ * scripts we await load before resolving so callers can preserve original
+ * document order (browsers don't guarantee execution order for scripts that
+ * are appended programmatically — only for scripts present at parse time).
+ */
+function appendNode(parent: HTMLElement, node: Node): Promise<void> {
+  if (node.nodeType !== 1) {
+    parent.appendChild(node.cloneNode(true));
+    return Promise.resolve();
+  }
+  const el = node as HTMLElement;
+  const tag = el.tagName.toLowerCase();
+  if (tag !== 'script') {
+    parent.appendChild(el.cloneNode(true));
+    return Promise.resolve();
+  }
+  const ns = document.createElement('script');
+  for (let i = 0; i < el.attributes.length; i++) {
+    const a = el.attributes[i];
+    ns.setAttribute(a.name, a.value);
+  }
+  const src = ns.getAttribute('src');
+  // Inline script: appendChild executes synchronously, so we're done.
+  if (!src) {
+    ns.text = el.textContent || '';
+    parent.appendChild(ns);
+    return Promise.resolve();
+  }
+  // Async/defer scripts: fire-and-forget — original page didn't depend on order.
+  if (ns.async || ns.defer) {
+    parent.appendChild(ns);
+    return Promise.resolve();
+  }
+  // Classic external script: must wait for it to load before continuing so
+  // dependent inline scripts (e.g. WebFont.load(...) using webfont.js) don't
+  // run before the dependency is defined.
+  return new Promise<void>((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    ns.addEventListener('load', finish, { once: true });
+    ns.addEventListener('error', finish, { once: true });
+    parent.appendChild(ns);
+  });
+}
+
+async function injectInOrder(html: string, target: HTMLElement) {
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html;
+  const nodes = Array.from(tpl.content.childNodes);
+  for (const n of nodes) {
+    try {
+      await appendNode(target, n);
+    } catch (err) {
+      // Inline scripts can throw synchronously during appendChild (e.g. a
+      // missing global). Swallow so a single faulty tag doesn't break the
+      // rest of the injection chain (esp. jquery/webflow.js in body).
+      // eslint-disable-next-line no-console
+      console.warn('[cleave] script failed to execute', err);
+    }
+  }
+}
+
+export function SiteBootstrap({ headHtml, bodyScriptsHtml }: SiteBootstrapProps) {
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (window.__cleaveBootstrapped) return;
+    window.__cleaveBootstrapped = true;
+
+    (async () => {
+      // Hoist original <head> contents (CSS links, inline <style>, jQuery,
+      // WebFont loader) IN ORDER so dependency chains hold.
+      if (headHtml) await injectInOrder(headHtml, document.head);
+      // Then body-level scripts (webflow.js, GA, structured data) AFTER head
+      // is fully ready, so things like webflow.js can find jQuery + the DOM.
+      if (bodyScriptsHtml) await injectInOrder(bodyScriptsHtml, document.body);
+    })();
+  }, [headHtml, bodyScriptsHtml]);
+
+  return null;
+}
+`;
 
 export function pageTsx(meta: NextProjectMeta): string {
   const imports = meta.sections
@@ -248,10 +337,20 @@ export function sectionTsx(name: string, html: string): string {
   return `// Auto-generated by Cleave from the original site.
 // Renders the captured HTML verbatim so Webflow IX2 / Swiper / inline SVGs / runtime JS
 // continue to work. Replace with hand-written JSX to introduce React state or props.
+//
+// suppressHydrationWarning: webflow.js mutates DOM (adds w-mod-* classes,
+// rewrites styles, attaches event handlers) after mount; we don't want React
+// to warn or unmount any of that.
 const HTML = ${JSON.stringify(html)};
 
 export function ${name}() {
-  return <div data-cleave-section=${JSON.stringify(name)} dangerouslySetInnerHTML={{ __html: HTML }} />;
+  return (
+    <div
+      data-cleave-section=${JSON.stringify(name)}
+      suppressHydrationWarning
+      dangerouslySetInnerHTML={{ __html: HTML }}
+    />
+  );
 }
 `;
 }

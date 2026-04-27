@@ -1,23 +1,30 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { stat, unlink } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
+import { createAuthRouter, loadSession, requireAuth, type AuthedRequest } from './auth.js';
+import { createAdminRouter, createPublicPlansRouter } from './admin.js';
+import { createBillingRouter, handleStripeWebhook } from './billing.js';
+import { createProfileRouter } from './profile.js';
+import { createFeedbackRouter, createAdminFeedbackRouter } from './feedback.js';
+import { prisma } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = path.resolve(__dirname, '..');
 const ROOT_DIR = path.resolve(__dirname, '../..');
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3001;
 
-// ---------------------------------------------------------------------------
-// Job store (in-memory – swap for Redis/Postgres when going SaaS)
-// ---------------------------------------------------------------------------
-
 interface Job {
   id: string;
+  userId: string;
   url: string;
   status: 'processing' | 'complete' | 'error';
   logs: string[];
@@ -30,11 +37,11 @@ interface Job {
   reactFileSize?: number;
   pages?: number;
   assets?: number;
+  dbId?: string;
 }
 
 const jobs = new Map<string, Job>();
 
-// Clean up old jobs every 10 minutes (30 min TTL)
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs) {
@@ -47,41 +54,114 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-// ---------------------------------------------------------------------------
-// Express app
-// ---------------------------------------------------------------------------
-
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.set('trust proxy', 1);
 
-// Serve built frontend in production
+// Stripe webhook MUST receive the raw body — register BEFORE express.json()
+app.post(
+  '/api/billing/webhook',
+  express.raw({ type: 'application/json' }),
+  handleStripeWebhook,
+);
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+  }),
+);
+app.use(
+  cors({
+    origin: process.env.WEB_BASE_URL || 'http://localhost:5173',
+    credentials: true,
+  }),
+);
+app.use(express.json({ limit: '1mb' }));
+app.use(cookieParser());
+app.use(loadSession);
+
+const generalLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 300,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+});
+const authLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+});
+const exportLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 5,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+});
+app.use('/api/', generalLimiter);
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
+
+app.use('/api/auth', createAuthRouter());
+app.use('/api/admin', createAdminRouter());
+app.use('/api/admin/feedback', createAdminFeedbackRouter());
+app.use('/api/plans', createPublicPlansRouter());
+app.use('/api/billing', createBillingRouter());
+app.use('/api/profile', createProfileRouter());
+app.use('/api/feedback', createFeedbackRouter());
+
 if (process.env.NODE_ENV === 'production') {
   app.use(express.static(path.join(WEB_DIR, 'dist')));
 }
 
-// ---------------------------------------------------------------------------
-// POST /api/export — start a new export job
-// ---------------------------------------------------------------------------
-
-app.post('/api/export', (req, res) => {
+app.post('/api/export', exportLimiter, requireAuth, async (req: AuthedRequest, res) => {
   const { url, depth = 0, maxPages = 50, concurrency = 3, format = 'html' } = req.body;
 
   if (!['html', 'react', 'both'].includes(format)) {
-    res.status(400).json({ error: "format must be 'html', 'react', or 'both'" });
-    return;
+    return res.status(400).json({ error: "format must be 'html', 'react', or 'both'" });
   }
-
-  // Basic URL validation
   try {
     const parsed = new URL(url);
     if (!['http:', 'https:'].includes(parsed.protocol)) {
-      res.status(400).json({ error: 'Only HTTP/HTTPS URLs are supported' });
-      return;
+      return res.status(400).json({ error: 'Only HTTP/HTTPS URLs are supported' });
     }
   } catch {
-    res.status(400).json({ error: 'Invalid URL format' });
-    return;
+    return res.status(400).json({ error: 'Invalid URL format' });
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.id },
+    include: { plan: true },
+  });
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+  const plan = user.plan;
+  if (!plan) return res.status(403).json({ error: 'No plan assigned. Contact support.' });
+
+  if ((format === 'react' || format === 'both') && !plan.allowReact) {
+    return res.status(403).json({
+      error: 'React output requires the Pro plan or higher.',
+      upgrade: true,
+    });
+  }
+  const requestedPages = Math.max(1, Number(maxPages) || 1);
+  if (requestedPages > plan.maxPagesPerCrawl) {
+    return res.status(403).json({
+      error: `Your plan allows up to ${plan.maxPagesPerCrawl} pages per crawl. Upgrade for more.`,
+      upgrade: true,
+    });
+  }
+
+  const start = new Date();
+  start.setUTCDate(1);
+  start.setUTCHours(0, 0, 0, 0);
+  const used = await prisma.exportJob.count({
+    where: { userId: user.id, createdAt: { gte: start } },
+  });
+  if (used >= plan.maxExportsPerMonth) {
+    return res.status(403).json({
+      error: `Monthly export limit reached (${plan.maxExportsPerMonth}). Upgrade for more.`,
+      upgrade: true,
+    });
   }
 
   const jobId = randomUUID();
@@ -90,12 +170,17 @@ app.post('/api/export', (req, res) => {
 
   const args = ['tsx', 'src/index.ts', url, '-o', outputPath];
   if (depth > 0) args.push('-d', String(depth));
-  args.push('-c', String(concurrency));
-  args.push('-m', String(maxPages));
+  args.push('-c', String(Math.max(1, Math.min(10, Number(concurrency) || 3))));
+  args.push('-m', String(requestedPages));
   args.push('-f', format);
+
+  const dbJob = await prisma.exportJob.create({
+    data: { userId: user.id, url, format, status: 'processing' },
+  });
 
   const job: Job = {
     id: jobId,
+    userId: user.id,
     url,
     status: 'processing',
     logs: [],
@@ -104,6 +189,7 @@ app.post('/api/export', (req, res) => {
     format: format as 'html' | 'react' | 'both',
     process: null,
     createdAt: Date.now(),
+    dbId: dbJob.id,
   };
 
   const proc = spawn('npx', args, {
@@ -113,22 +199,14 @@ app.post('/api/export', (req, res) => {
   });
 
   const onData = (data: Buffer) => {
-    const lines = data
-      .toString()
-      .split('\n')
-      .filter((l) => l.trim());
+    const lines = data.toString().split('\n').filter((l) => l.trim());
     job.logs.push(...lines);
-
-    // Parse stats from log output
     for (const line of lines) {
       const pagesMatch = line.match(/Crawl complete:\s*(\d+)\s*pages/);
       if (pagesMatch) job.pages = parseInt(pagesMatch[1]);
-
       if (line.includes('Export complete')) job.pages = job.pages || 1;
-
       const assetMatch = line.match(/"(?:assetCount|totalAssets|assets)"[:\s]*(\d+)/);
       if (assetMatch) job.assets = parseInt(assetMatch[1]);
-
       const sizeMatch = line.match(/"size"[:\s]*"([\d.]+)\s*MB"/);
       if (sizeMatch) job.fileSize = parseFloat(sizeMatch[1]) * 1024 * 1024;
     }
@@ -142,22 +220,31 @@ app.post('/api/export', (req, res) => {
     job.process = null;
 
     if (code === 0) {
-      if (job.format === 'html' || job.format === 'both') {
+      if (job.format === 'html') {
+        try { job.fileSize = (await stat(outputPath)).size; } catch {}
+      } else if (job.format === 'react') {
         try {
           const stats = await stat(outputPath);
-          job.fileSize = stats.size;
-        } catch {
-          /* file may not exist if something went wrong */
-        }
-      }
-      if (job.format === 'react' || job.format === 'both') {
-        try {
-          const stats = await stat(reactPath);
           job.reactFileSize = stats.size;
-        } catch {
-          /* file may not exist */
-        }
+          job.reactPath = outputPath;
+        } catch {}
+      } else {
+        try { job.fileSize = (await stat(outputPath)).size; } catch {}
+        try { job.reactFileSize = (await stat(reactPath)).size; } catch {}
       }
+    }
+
+    if (job.dbId) {
+      await prisma.exportJob
+        .update({
+          where: { id: job.dbId },
+          data: {
+            status: job.status,
+            pages: job.pages ?? 0,
+            bytes: (job.fileSize ?? 0) + (job.reactFileSize ?? 0),
+          },
+        })
+        .catch(() => {});
     }
   });
 
@@ -167,15 +254,10 @@ app.post('/api/export', (req, res) => {
   res.json({ jobId });
 });
 
-// ---------------------------------------------------------------------------
-// GET /api/export/:id/progress — SSE stream
-// ---------------------------------------------------------------------------
-
-app.get('/api/export/:id/progress', (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job) {
-    res.status(404).json({ error: 'Job not found' });
-    return;
+app.get('/api/export/:id/progress', requireAuth, (req: AuthedRequest, res) => {
+  const job = jobs.get(req.params.id as string);
+  if (!job || job.userId !== req.user!.id) {
+    return res.status(404).json({ error: 'Job not found' });
   }
 
   res.writeHead(200, {
@@ -185,7 +267,6 @@ app.get('/api/export/:id/progress', (req, res) => {
     'X-Accel-Buffering': 'no',
   });
 
-  // If already finished, send result immediately
   if (job.status === 'complete') {
     res.write(
       `data: ${JSON.stringify({ type: 'complete', fileSize: job.fileSize, reactFileSize: job.reactFileSize, format: job.format, pages: job.pages, assets: job.assets })}\n\n`,
@@ -200,14 +281,11 @@ app.get('/api/export/:id/progress', (req, res) => {
   }
 
   let lastIndex = 0;
-
   const interval = setInterval(() => {
-    // Send new log lines
     while (lastIndex < job.logs.length) {
       res.write(`data: ${JSON.stringify({ type: 'log', message: job.logs[lastIndex] })}\n\n`);
       lastIndex++;
     }
-
     if (job.status === 'complete') {
       res.write(
         `data: ${JSON.stringify({ type: 'complete', fileSize: job.fileSize, reactFileSize: job.reactFileSize, format: job.format, pages: job.pages, assets: job.assets })}\n\n`,
@@ -227,21 +305,14 @@ app.get('/api/export/:id/progress', (req, res) => {
   req.on('close', () => clearInterval(interval));
 });
 
-// ---------------------------------------------------------------------------
-// GET /api/export/:id/download — download the ZIP
-// ---------------------------------------------------------------------------
-
-app.get('/api/export/:id/download', (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job || job.status !== 'complete') {
-    res.status(404).json({ error: 'Export not ready' });
-    return;
+app.get('/api/export/:id/download', requireAuth, (req: AuthedRequest, res) => {
+  const job = jobs.get(req.params.id as string);
+  if (!job || job.userId !== req.user!.id || job.status !== 'complete') {
+    return res.status(404).json({ error: 'Export not ready' });
   }
-
   const variant = (req.query.format as string) === 'react' ? 'react' : 'html';
   const filePath = variant === 'react' ? job.reactPath : job.outputPath;
   const suffix = variant === 'react' ? '-react' : '';
-
   try {
     const hostname = new URL(job.url).hostname;
     res.download(filePath, `${hostname}${suffix}.zip`);
@@ -250,49 +321,30 @@ app.get('/api/export/:id/download', (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// DELETE /api/export/:id — cancel an export
-// ---------------------------------------------------------------------------
-
-app.delete('/api/export/:id', (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job) {
-    res.status(404).json({ error: 'Job not found' });
-    return;
+app.delete('/api/export/:id', requireAuth, (req: AuthedRequest, res) => {
+  const job = jobs.get(req.params.id as string);
+  if (!job || job.userId !== req.user!.id) {
+    return res.status(404).json({ error: 'Job not found' });
   }
-
   if (job.process) {
     job.process.kill();
     job.process = null;
   }
   job.status = 'error';
-
   unlink(job.outputPath).catch(() => {});
   unlink(job.reactPath).catch(() => {});
   res.json({ success: true });
 });
 
-// ---------------------------------------------------------------------------
-// GET /api/health
-// ---------------------------------------------------------------------------
-
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', jobs: jobs.size });
 });
-
-// ---------------------------------------------------------------------------
-// SPA fallback (production)
-// ---------------------------------------------------------------------------
 
 if (process.env.NODE_ENV === 'production') {
   app.get('*', (_req, res) => {
     res.sendFile(path.join(WEB_DIR, 'dist', 'index.html'));
   });
 }
-
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
 
 app.listen(PORT, () => {
   console.log(`⚡ Cleave server running on http://localhost:${PORT}`);

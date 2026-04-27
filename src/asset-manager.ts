@@ -75,10 +75,31 @@ const NOISE_HOST_BLOCKLIST = new Set([
   'www.facebook.com',
   'snap.licdn.com',
   'px.ads.linkedin.com',
+  'analytics.webflow.com',
+  'analytics-api.webflow.com',
+  'api.segment.io',
+  'cdn.segment.com',
+  'cdn.madkudu.com',
+  'api.sprig.com',
+  'browser-intake-datadoghq.com',
+  'prodregistryv2.org',
+  'js.partnerstack.com',
+  'snippet.growsumo.com',
+  'app.birdie.so',
+  'cf.birdie.so',
+  'statsigapi.net',
+  'collector-pxtg2vkiqj.px-cloud.net',
+  'cdn.dev.website-files.com',
+  'dev-assets.website-files.com',
+  'dev-assets-global.website-files.com',
+  'webflow-files-dev.global.ssl.fastly.net',
 ]);
 // Hosts where only specific path prefixes are real assets
 const HOST_PATH_ALLOWLIST: Record<string, string[]> = {
-  'framerusercontent.com': ['/images/', '/assets/', '/modules/'],
+  // Framer serves both static media and compiled route/runtime chunks from
+  // /sites/<siteId>/... . Those .mjs files are required for page rendering
+  // and interactions, so filtering them out leaves exported pages half-loaded.
+  'framerusercontent.com': ['/images/', '/assets/', '/modules/', '/sites/'],
 };
 
 // Per-host path denylist (regex, applied if no allowlist matches).
@@ -90,6 +111,14 @@ const HOST_PATH_DENY_REGEX: Record<string, RegExp> = {
   // served flat at /{siteId}/{filename}.
   'cdn.prod.website-files.com': /^\/[a-f0-9]{20,}\/(?:fonts|images|videos|documents)\//i,
   'uploads-ssl.webflow.com': /^\/[a-f0-9]{20,}\/(?:fonts|images|videos|documents)\//i,
+  // Webflow bundles also embed root-relative telemetry/error-reporting paths
+  // like /init.js, /main.min.js, /captcha.js, /1.gif and /<uuid>/airgap.js.
+  // Those are runtime-generated probes, not real downloadable assets.
+  'webflow.com': /^(?:\/(?:analytics(?:\.min)?\.js|main(?:\.min)?\.js|captcha\.js|1\.gif|init\.js)|\/[a-f0-9-]{36}\/airgap\.js|\/assets-marketplace\/_next\/static\/fonts\/Inter-[A-Za-z0-9.-]+\.(?:woff2?|ttf|otf))$/i,
+  'www.webflow.com': /^(?:\/(?:analytics(?:\.min)?\.js|main(?:\.min)?\.js|captcha\.js|1\.gif|init\.js)|\/[a-f0-9-]{36}\/airgap\.js|\/assets-marketplace\/_next\/static\/fonts\/Inter-[A-Za-z0-9.-]+\.(?:woff2?|ttf|otf))$/i,
+  'd3e54v103j8qbb.cloudfront.net': /^(?:\/(?:analytics(?:\.min)?\.js|main(?:\.min)?\.js|captcha\.js|1\.gif|init\.js)|\/[a-f0-9-]{36}\/airgap\.js)$/i,
+  'accounts.google.com': /^\/gsi\/(?:fedcm(?:[./]|$)|log$)/i,
+  's3.amazonaws.com': /^\/webflow-(?:dev|prod)-assets\//i,
 };
 
 // Generic path denylist applied to ANY host. Use for path patterns that
@@ -103,6 +132,7 @@ const GENERIC_PATH_DENY_REGEX: RegExp[] = [
   /\/wp-admin\/admin-ajax\.php/i, // WordPress AJAX
   /\/wp-json\//i, // WordPress REST API
   /\/api\/auth\//i, // Auth callbacks
+  /\/gsi\/fedcm(?:[./]|$)/i, // Google FedCM helper/config endpoints
 ];
 
 export function isLikelyAssetUrl(raw: string): boolean {
@@ -132,6 +162,63 @@ export function isLikelyAssetUrl(raw: string): boolean {
 
 function hashUrl(url: string): string {
   return createHash('md5').update(url).digest('hex').slice(0, 10);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function decodePathSegment(segment: string): string {
+  let decoded = segment;
+  for (let i = 0; i < 3; i++) {
+    let next: string;
+    try {
+      next = decodeURIComponent(decoded);
+    } catch {
+      break;
+    }
+    if (next === decoded) break;
+    decoded = next;
+  }
+  return decoded;
+}
+
+function getDecodedFilename(url: string): string | null {
+  try {
+    const pathname = new URL(url).pathname;
+    const filename = pathname.split('/').pop();
+    return filename ? decodePathSegment(filename) : null;
+  } catch {
+    return null;
+  }
+}
+
+function getStructuredRuntimePath(url: string): string | null {
+  let pathname = '';
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    return null;
+  }
+
+  const shouldPreserve =
+    /^\/assets-marketplace\/_next\//i.test(pathname) ||
+    /^\/_next\//i.test(pathname) ||
+    /^\/[A-Za-z0-9_-]{6,}\/.+\.(?:m?js|css|json|wasm|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|otf|eot)$/i.test(pathname);
+
+  if (!shouldPreserve) {
+    return null;
+  }
+
+  const normalized = posix.normalize(pathname).replace(/^\/+/, '');
+  if (!normalized || normalized.startsWith('..')) {
+    return null;
+  }
+
+  return normalized
+    .split('/')
+    .map((segment) => decodePathSegment(segment))
+    .join('/');
 }
 
 /**
@@ -169,6 +256,19 @@ export class AssetManager {
   // dir layout for the import to resolve locally).
   private readonly pinnedLocalPath: Map<string, string> = new Map();
 
+  private findExistingAssetByFilename(url: string): AssetRecord | null {
+    const filename = getDecodedFilename(url);
+    if (!filename) return null;
+
+    for (const record of this.assets.values()) {
+      if (posix.basename(record.localPath) === filename) {
+        return record;
+      }
+    }
+
+    return null;
+  }
+
   constructor(config?: AssetManagerConfig) {
     this.concurrency = config?.concurrency ?? DEFAULT_CONCURRENCY;
     this.maxFileSize = config?.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
@@ -200,6 +300,20 @@ export class AssetManager {
   }
 
   getLocalPath(url: string): string {
+    const structuredPath = getStructuredRuntimePath(url);
+    if (structuredPath) {
+      const count = this.localPathCounts.get(structuredPath) ?? 0;
+      if (count === 0) {
+        this.localPathCounts.set(structuredPath, 1);
+        return structuredPath;
+      }
+
+      const parsed = posix.parse(structuredPath);
+      const dedupPath = posix.join(parsed.dir, `${parsed.name}-${count}${parsed.ext}`);
+      this.localPathCounts.set(structuredPath, count + 1);
+      return dedupPath;
+    }
+
     let filename = '';
     let ext = '';
 
@@ -214,18 +328,7 @@ export class AssetManager {
         // request after they decode the path. Some CDNs (Webflow) double-encode
         // filenames containing spaces (e.g. "Foo%2520Bar.png" -> "Foo Bar.png").
         // Stop when decoding is idempotent or after a small bound.
-        let decoded = lastSegment;
-        for (let i = 0; i < 3; i++) {
-          let next: string;
-          try {
-            next = decodeURIComponent(decoded);
-          } catch {
-            break;
-          }
-          if (next === decoded) break;
-          decoded = next;
-        }
-        filename = decoded;
+        filename = decodePathSegment(lastSegment);
       }
     } catch {
       // fall through
@@ -617,6 +720,11 @@ export class AssetManager {
   }
 
   rewriteHtmlPaths($: cheerio.CheerioAPI, pageLocalPath?: string): void {
+    const getEncodedLocalPath = (record: AssetRecord): string => {
+      const raw = pageLocalPath ? getRelativePath(pageLocalPath, record.localPath) : record.localPath;
+      return encodeLocalUrl(raw);
+    };
+
     const rewriteAttr = (selector: string, attr: string, stripSri = false): void => {
       $(selector).each((_, el) => {
         const val = $(el).attr(attr);
@@ -624,8 +732,7 @@ export class AssetManager {
         const resolved = resolveUrl(val, this.baseUrl);
         const record = this.assets.get(resolved);
         if (record) {
-          const raw = pageLocalPath ? getRelativePath(pageLocalPath, record.localPath) : record.localPath;
-          $(el).attr(attr, encodeLocalUrl(raw));
+          $(el).attr(attr, getEncodedLocalPath(record));
           if (stripSri) {
             // Subresource Integrity hashes are bound to the original CDN bytes; once we
             // serve the file from a local path the browser will refuse to load it because
@@ -648,6 +755,7 @@ export class AssetManager {
     rewriteAttr('link[rel="icon"][href]', 'href');
     rewriteAttr('link[rel="apple-touch-icon"][href]', 'href');
     rewriteAttr('link[rel="preload"][href]', 'href', true);
+    rewriteAttr('link[rel="prefetch"][href]', 'href', true);
 
     const rewriteSrcset = (selector: string): void => {
       $(selector).each((_, el) => {
@@ -676,6 +784,37 @@ export class AssetManager {
 
     rewriteSrcset('img[srcset]');
     rewriteSrcset('source[srcset]');
+
+    const quotedReplacements = [...this.assets.values()]
+      .map((record) => {
+        try {
+          const pathname = new URL(record.url).pathname;
+          if (!pathname.startsWith('/')) return null;
+          return {
+            pathname,
+            replacement: getEncodedLocalPath(record),
+          };
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry): entry is { pathname: string; replacement: string } => entry !== null)
+      .sort((a, b) => b.pathname.length - a.pathname.length);
+
+    $('script:not([src])').each((_, el) => {
+      const content = $(el).html();
+      if (!content) return;
+
+      let rewritten = content;
+      for (const { pathname, replacement } of quotedReplacements) {
+        const pattern = new RegExp(`(["'\\"])${escapeRegExp(pathname)}\\1`, 'g');
+        rewritten = rewritten.replace(pattern, (_match, quote: string) => `${quote}${replacement}${quote}`);
+      }
+
+      if (rewritten !== content) {
+        $(el).html(rewritten);
+      }
+    });
   }
 
   /**
@@ -877,7 +1016,7 @@ export class AssetManager {
         if (urlValue.startsWith('data:') || urlValue.startsWith('blob:')) return;
         const resolvedUrl = resolveUrl(urlValue, cssUrl);
         if (!resolvedUrl || !isAbsoluteUrl(resolvedUrl)) return;
-        const record = this.assets.get(resolvedUrl);
+        const record = this.assets.get(resolvedUrl) ?? this.findExistingAssetByFilename(resolvedUrl);
         if (!record) return;
         firstChild.value = encodeLocalUrl(posix.relative(cssLocalDir, record.localPath));
         if (firstChild.type === 'string') firstChild.quote = "'";

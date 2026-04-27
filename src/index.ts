@@ -5,7 +5,7 @@ import { AssetManager } from './asset-manager.js';
 import { transform, detectPackages } from './transformer/index.js';
 import { bundle, bundleSite, bundleReact } from './bundler.js';
 import { SiteCrawler } from './site-crawler.js';
-import { remapLinks } from './link-mapper.js';
+import { normalizeSinglePageLinks, remapLinks } from './link-mapper.js';
 import { convertToReact } from './react-converter/index.js';
 import { isSafeUrl } from './utils/url-validator.js';
 import { logger } from './utils/logger.js';
@@ -79,13 +79,14 @@ async function exportSinglePage(options: MultiPageExportOptions): Promise<void> 
     webhookUrl: options.webhookUrl,
     assets: processed.assets,
   });
+  const linkedHtml = normalizeSinglePageLinks(cleanHtml, baseUrl);
 
   // Step 5: Bundle into ZIP(s)
   logger.info('Step 4/4: Bundling ZIP...');
   const outputPath = options.output ?? 'export.zip';
 
   if (format === 'html' || format === 'both') {
-    const zipBuffer = await bundle(cleanHtml, processed.assets);
+    const zipBuffer = await bundle(linkedHtml, processed.assets);
     await writeFile(outputPath, zipBuffer);
     logger.info(`HTML export complete! Saved to ${outputPath}`, {
       size: `${(zipBuffer.length / 1024 / 1024).toFixed(2)} MB`,
@@ -96,7 +97,7 @@ async function exportSinglePage(options: MultiPageExportOptions): Promise<void> 
   if (format === 'react' || format === 'both') {
     const reactFiles = convertToReact({
       sourceUrl: baseUrl,
-      html: cleanHtml,
+      html: linkedHtml,
       assets: processed.assets,
     });
     const reactZipBuffer = await bundleReact(reactFiles);

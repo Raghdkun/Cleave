@@ -9,6 +9,7 @@ grillify-test/
 slice-town/
 slice-town-html/
 webflow/
+validation-runs/
 
 # OS files
 .DS_Store

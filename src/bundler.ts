@@ -98,8 +98,32 @@ echo ERROR: need python, npx, or php installed to serve this folder.
 pause
 `;
 
+const REPORT_URL = process.env.CLEAVE_FEEDBACK_URL || 'https://cleave.app/feedback';
+
+const REPORT_TXT = `Cleave - Found a problem? Report it.
+=====================================
+
+Did this export break? Missing assets, broken layout, JavaScript not
+running, fonts not loading, or anything else? We want to fix it.
+
+Open this URL in your browser to file a report:
+
+  ${REPORT_URL}?source=download
+
+What helps us reproduce the bug:
+  - The original site URL you exported
+  - What you expected to happen
+  - What actually happened (screenshots are great)
+  - Your browser + OS
+
+You can also report general feedback or feature ideas there.
+
+Thanks for helping make Cleave better.
+`;
+
 function addLauncher(zip: JSZip): void {
   zip.file('README.txt', README_TXT);
+  zip.file('REPORT_A_BUG.txt', REPORT_TXT);
   // unix exec bit (0755)
   zip.file('start.sh', START_SH, {
     unixPermissions: parseInt('755', 8),

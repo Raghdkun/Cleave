@@ -96,3 +96,43 @@ export function remapLinks(
 
   return $.html();
 }
+
+export function normalizeSinglePageLinks(html: string, siteBaseUrl: string): string {
+  const $ = cheerio.load(html, { xml: false } as cheerio.CheerioOptions);
+  const currentPageUrl = normalizeUrlForLookup(siteBaseUrl);
+
+  $('a[href]').each((_i, el) => {
+    const href = $(el).attr('href');
+    if (!href || !href.trim()) return;
+
+    const hrefLower = href.toLowerCase();
+    for (const scheme of SKIP_SCHEMES) {
+      if (hrefLower.startsWith(scheme)) return;
+    }
+
+    let fragment = '';
+    const hashIndex = href.indexOf('#');
+    if (hashIndex !== -1) {
+      fragment = href.slice(hashIndex);
+    }
+
+    const hrefBase = hashIndex !== -1 ? href.slice(0, hashIndex) : href;
+    if (!hrefBase) return;
+
+    const resolved = resolveUrl(hrefBase, siteBaseUrl);
+    if (resolved === hrefBase && !hrefBase.startsWith('http')) {
+      return;
+    }
+
+    const normalized = normalizeUrlForLookup(resolved);
+
+    if (normalized === currentPageUrl) {
+      $(el).attr('href', fragment || './');
+      return;
+    }
+
+    $(el).attr('href', resolved + fragment);
+  });
+
+  return $.html();
+}

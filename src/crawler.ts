@@ -46,6 +46,13 @@ export class Crawler {
     }
 
     const page = await this.browser.newPage();
+    await page.addInitScript(() => {
+      try {
+        history.scrollRestoration = 'manual';
+      } catch {
+        // Ignore environments that don't expose history.scrollRestoration.
+      }
+    });
 
     // Capture every successful asset response (catches dynamic imports + lazy chunks
     // that aren't statically referenced in the HTML).
@@ -75,24 +82,17 @@ export class Crawler {
 
     try {
       logger.info(`Navigating to ${url}...`);
-      try {
-        await page.goto(url, {
-          waitUntil: 'networkidle',
-          timeout: this.config.timeout,
-        });
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (message.includes('Timeout') || message.includes('TimeoutError')) {
-          logger.warn('networkidle timed out, falling back to domcontentloaded');
-          await page.goto(url, {
-            waitUntil: 'domcontentloaded',
-            timeout: this.config.timeout,
-          });
-          await page.waitForTimeout(3000);
-        } else {
-          throw err;
-        }
-      }
+      await this.gotoWithFallback(page, url);
+
+      const shouldCaptureRawHtml = await page.evaluate(() => {
+        const generator =
+          document.querySelector('meta[name="generator"]')?.getAttribute('content') ?? '';
+        if (/framer/i.test(generator)) return true;
+
+        return Boolean(
+          document.querySelector('[data-framer-component-type], [data-framer-name]'),
+        );
+      });
 
       // Trigger lazy-loaded content: scroll through the full page so intersection
       // observers fire and route-based dynamic imports get pulled.
@@ -104,6 +104,37 @@ export class Crawler {
       } catch {
         // Best-effort
       }
+
+      // Asset discovery wants the page to scroll; HTML capture does not. Reload the
+      // settled URL so we serialize the page from its initial state instead of from
+      // a post-scroll DOM with triggered entrance animations / pinned transforms.
+      const captureUrl = page.url();
+      logger.info('Resetting page to initial state for HTML capture...');
+      let rawHtml: string | null = null;
+      if (shouldCaptureRawHtml) {
+        logger.info('Using raw response HTML for capture to avoid client hydration drift');
+        const response = await page.goto(captureUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: this.config.timeout,
+        });
+        if (response) {
+          try {
+            rawHtml = await response.text();
+          } catch {
+            // Fall back to DOM serialization below if the response body isn't available.
+          }
+        }
+      } else {
+        await this.gotoWithFallback(page, captureUrl);
+      }
+      await page.evaluate(() => {
+        try {
+          history.scrollRestoration = 'manual';
+        } catch {
+          // Ignore unsupported environments.
+        }
+        window.scrollTo(0, 0);
+      });
 
       logger.info('Page loaded, extracting HTML...');
 
@@ -118,166 +149,64 @@ export class Crawler {
         baseUrl = new URL(baseHref, baseUrl).href;
       }
 
-      // Sanitize transient mid-page-load DOM mutations before serializing.
-      //
-      // Many sites (Webflow especially) run a DOMContentLoaded handler that
-      // sets `body.style.overflow = "hidden"` to lock scroll while a preloader
-      // animation plays, then clears it when the preloader finishes. If the
-      // crawler captures the DOM while the preloader is still mid-animation
-      // (Webflow IX2 leaves it at `style="display: flex; opacity: 0;"`), the
-      // exported page boots with body locked AND a preloader element that
-      // never reaches `display: none`, so the lock is never released and the
-      // page is permanently un-scrollable / un-clickable.
-      //
-      // Strip the inline overflow on <html>/<body> so the static export starts
-      // with normal scroll. The page's own load script will re-apply it on the
-      // user's browser if needed; or the preloader will simply not block.
-      await page.evaluate(() => {
-        for (const el of [document.documentElement, document.body]) {
-          if (!el) continue;
-          if (/overflow\s*:/.test(el.getAttribute('style') ?? '')) {
-            el.style.removeProperty('overflow');
-            el.style.removeProperty('overflow-x');
-            el.style.removeProperty('overflow-y');
-            if (!el.getAttribute('style')?.trim()) el.removeAttribute('style');
-          }
-        }
-        // Reset preloader-style elements that animation systems left in a
-        // mid-animation state. We only target elements whose CLASS hints at
-        // "preloader" / "loader" / "loading" intent so we don't disturb
-        // legitimate page state.
-        const sel = '[class*="preloader"], [class*="page-loader"], [id*="preloader"]';
-        for (const el of document.querySelectorAll<HTMLElement>(sel)) {
-          // If JS animation parked it at opacity:0 / display:none / visibility:hidden,
-          // it has effectively finished. Remove it from the DOM so the page-author's
-          // own load script (which often does `if (!preloader) return;` then locks
-          // body.overflow waiting for a *future* preloader mutation) bails out
-          // instead of locking the page forever.
-          const cs = getComputedStyle(el);
-          const finished =
-            cs.display === 'none' ||
-            cs.visibility === 'hidden' ||
-            parseFloat(cs.opacity) <= 0.01;
-          if (finished) {
-            el.remove();
-          }
-        }
-
-        // ---------------------------------------------------------------
-        // Strip JS-injected animation state from inline `style` attributes.
+      if (!rawHtml) {
+        // Sanitize transient mid-page-load DOM mutations before serializing.
         //
-        // GSAP, Webflow IX2, ScrollTrigger, Swiper, etc. inject inline
-        // `transform`, `opacity`, `will-change`, `transition-duration`
-        // continuously while the page runs. When we serialize the DOM
-        // mid-flight, these inline values persist into the static export
-        // and FREEZE the elements at whatever position they were in when
-        // we snapshotted.
+        // Many sites (Webflow especially) run a DOMContentLoaded handler that
+        // sets `body.style.overflow = "hidden"` to lock scroll while a preloader
+        // animation plays, then clears it when the preloader finishes. If the
+        // crawler captures the DOM while the preloader is still mid-animation
+        // (Webflow IX2 leaves it at `style="display: flex; opacity: 0;"`), the
+        // exported page boots with body locked AND a preloader element that
+        // never reaches `display: none`, so the lock is never released and the
+        // page is permanently un-scrollable / un-clickable.
         //
-        // CAUTION: Some libraries (raw GSAP `gsap.set()`, ScrollTrigger
-        // pinned panels) use inline `transform` as the INITIAL LAYOUT —
-        // not animation state. Stripping those breaks the page (panels
-        // collapse, pinned sections un-pin, layouts overlap).
-        //
-        // We only strip when we can identify the value as JS-animation
-        // state by a STRONG signature, not a weak one:
-        //   - `data-w-id` attribute (Webflow IX2's marker — guaranteed)
-        //   - Webflow IX2's 6-component identity transform signature:
-        //     `scale3d(...) rotateX(...) rotateY(...) rotateZ(...) skew(...)`
-        //     all present in the same value (never written by humans, only
-        //     by IX2's bake-out).
-        //   - Swiper's runtime classes (well-known library)
-        // ---------------------------------------------------------------
-        // Webflow IX2 baked-transform signature: contains scale3d AND
-        // rotateX AND rotateY AND rotateZ AND skew in one value. No human
-        // and no other animation library writes this exact 6-component form.
-        const IX2_TRANSFORM_RE =
-          /scale3d\([^)]*\).*rotateX\([^)]*\).*rotateY\([^)]*\).*rotateZ\([^)]*\).*skew\(/i;
-
-        const SWIPER_SEL =
-          '.swiper, .swiper-wrapper, .swiper-slide, [class*="swiper-"]';
-        const allEls = document.querySelectorAll<HTMLElement>('[style]');
-        for (const el of allEls) {
-          const style = el.getAttribute('style');
-          if (!style) continue;
-
-          // will-change is purely an optimization hint; stripping it never
-          // breaks layout but removes leftover hints from finished animations.
-          el.style.removeProperty('will-change');
-
-          // Webflow IX2 marks animated elements with `data-w-id`. Anything
-          // inline on those (transform/opacity/transition) is animation state.
-          const isIx2 = el.hasAttribute('data-w-id');
-          const inlineTransform = el.style.transform;
-          const ix2Transform =
-            !!inlineTransform && IX2_TRANSFORM_RE.test(inlineTransform);
-
-          if (isIx2 || ix2Transform) {
-            el.style.removeProperty('transform');
-            el.style.removeProperty('transform-style');
-            el.style.removeProperty('opacity');
-            el.style.removeProperty('transition');
-            el.style.removeProperty('transition-duration');
-            el.style.removeProperty('transition-property');
-            el.style.removeProperty('transition-delay');
+        // Strip the inline overflow on <html>/<body> so the static export starts
+        // with normal scroll. The page's own load script will re-apply it on the
+        // user's browser if needed; or the preloader will simply not block.
+        await page.evaluate(() => {
+          for (const el of [document.documentElement, document.body]) {
+            if (!el) continue;
+            if (/overflow\s*:/.test(el.getAttribute('style') ?? '')) {
+              el.style.removeProperty('overflow');
+              el.style.removeProperty('overflow-x');
+              el.style.removeProperty('overflow-y');
+              if (!el.getAttribute('style')?.trim()) el.removeAttribute('style');
+            }
           }
 
-          // Cleanup empty style attribute
-          if (!el.getAttribute('style')?.trim()) el.removeAttribute('style');
-        }
-
-        // Swiper-specific cleanup: Swiper writes inline transform/transition
-        // on .swiper-wrapper (slide offset) and .swiper-slide (per-slide
-        // transition-duration). It also adds runtime classes like
-        // swiper-initialized / swiper-slide-active that conflict with re-init.
-        for (const el of document.querySelectorAll<HTMLElement>(SWIPER_SEL)) {
-          el.style.removeProperty('transform');
-          el.style.removeProperty('transition');
-          el.style.removeProperty('transition-duration');
-          el.style.removeProperty('transition-delay');
-          if (!el.getAttribute('style')?.trim()) el.removeAttribute('style');
-          // Strip Swiper runtime state classes so re-init starts clean.
-          const runtimeClasses = [
-            'swiper-initialized',
-            'swiper-slide-active',
-            'swiper-slide-prev',
-            'swiper-slide-next',
-            'swiper-slide-duplicate-active',
-            'swiper-slide-duplicate-prev',
-            'swiper-slide-duplicate-next',
-            'swiper-slide-visible',
-            'swiper-horizontal',
-            'swiper-vertical',
-            'swiper-watch-progress',
-            'swiper-backface-hidden',
-          ];
-          for (const c of runtimeClasses) el.classList.remove(c);
-        }
-
-        // Some sites set scroll-progress driven CSS variables / inline width
-        // on progress bars (e.g. .border-grad-animation width:93.6%).
-        // These get baked in. We can't always tell which are animation-only,
-        // but if a class name suggests progress/scroll-driven, reset width.
-        const progressSel =
-          '[class*="border-grad-animation"], [class*="progress-bar"], [class*="scroll-progress"]';
-        for (const el of document.querySelectorAll<HTMLElement>(progressSel)) {
-          if (/width\s*:/i.test(el.getAttribute('style') ?? '')) {
-            el.style.removeProperty('width');
-            el.style.removeProperty('height');
-            if (!el.getAttribute('style')?.trim()) el.removeAttribute('style');
+          // Reset preloader-style elements that animation systems left in a
+          // mid-animation state. We only target elements whose CLASS hints at
+          // "preloader" / "loader" / "loading" intent so we don't disturb
+          // legitimate page state.
+          const sel = '[class*="preloader"], [class*="page-loader"], [id*="preloader"]';
+          for (const el of document.querySelectorAll<HTMLElement>(sel)) {
+            // If JS animation parked it at opacity:0 / display:none / visibility:hidden,
+            // it has effectively finished. Remove it from the DOM so the page-author's
+            // own load script (which often does `if (!preloader) return;` then locks
+            // body.overflow waiting for a *future* preloader mutation) bails out
+            // instead of locking the page forever.
+            const cs = getComputedStyle(el);
+            const finished =
+              cs.display === 'none' ||
+              cs.visibility === 'hidden' ||
+              parseFloat(cs.opacity) <= 0.01;
+            if (finished) {
+              el.remove();
+            }
           }
-        }
 
-        // Reset scroll position to top so any snapshot of scroll-dependent
-        // state (sticky/fixed offsets, pinned ScrollTrigger states) reflects
-        // the initial view, not the bottom of the page.
-        window.scrollTo(0, 0);
-      });
+          // Reset scroll position to top so any snapshot of scroll-dependent
+          // state reflects the initial view.
+          window.scrollTo(0, 0);
+        });
 
-      // Give animation libs one tick to settle into their initial state
-      // after we wiped the inline animation values.
-      await page.waitForTimeout(300);
+        // Give animation libs one tick to settle into their initial state
+        // after we wiped the inline animation values.
+        await page.waitForTimeout(300);
+      }
 
-      const html = await page.content();
+      const html = rawHtml ?? (await page.content());
 
       logger.info(`Crawl complete. Base URL: ${baseUrl}`);
       logger.info(`Discovered ${discoveredUrls.size} network assets`);
@@ -315,6 +244,27 @@ export class Crawler {
       });
     } catch {
       // Non-fatal
+    }
+  }
+
+  private async gotoWithFallback(page: import('playwright').Page, url: string): Promise<void> {
+    try {
+      await page.goto(url, {
+        waitUntil: 'networkidle',
+        timeout: this.config.timeout,
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('Timeout') || message.includes('TimeoutError')) {
+        logger.warn('networkidle timed out, falling back to domcontentloaded');
+        await page.goto(url, {
+          waitUntil: 'domcontentloaded',
+          timeout: this.config.timeout,
+        });
+        await page.waitForTimeout(3000);
+        return;
+      }
+      throw err;
     }
   }
 
